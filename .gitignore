@@ -1,0 +1,10 @@
+
+public_dataset/
+
+
+arduino/libraries/
+
+
+model/*.h5
+model/*.tflite
+model/*.h
