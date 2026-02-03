@@ -107,7 +107,7 @@ class AudioProcessor {
     bool getMFCCFeaturesFromAudio(const float* audio, int audio_length, int8_t* mfcc_output);
 
     // Check if we have enough audio for inference
-    bool hasEnoughAudio() { return samples_collected >= ANALYSIS_SAMPLES; }
+    bool hasEnoughAudio() { return _samples_collected >= ANALYSIS_SAMPLES; }
 
     // Get audio statistics for debugging
     void getAudioStats(float& rms, float& peak, float& dc_offset);
