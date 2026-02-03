@@ -1,43 +1,209 @@
-
-#include <stdint.h>
-#include <Arduino.h>
-#include <tflm_esp32.h>
 #include <eloquent_tinyml.h>
-
+#include <Arduino.h>
 #include "model_data.h"
 #include "audio_processor.h"
 
+// ======================= HARDWARE CONFIG =======================
+#define I2S_BCK_PIN 18
+#define I2S_WS_PIN 19
+#define I2S_SD_PIN 20
+#define I2S_PORT I2S_NUM_0
 
-#define I2S_SD_PIN 10 // mic SD -> GPIO 7
-#define I2S_SCK_PIN 12// mic SCK -> GPIO 8
-#define I2S_WS_PIN 11// Mic WS -> GPIO 9
-
-// the input size 280 samples *40 mfccs
-#define NUMBER_OF_INPUTS 11200
-// tensor arena is the number of bytes reserved for the TFML scratch memory
+// ======================= AUDIO/MODEL CONSTANTS =======================
+#define SAMPLE_RATE 16000
+#define ANALYSIS_SECONDS 9
+#define ANALYSIS_SAMPLES (SAMPLE_RATE * ANALYSIS_SECONDS) // 144000
+#define NUMBER_OF_INPUTS 11200                            // 280 frames * 40 MFCCs
 #define TENSOR_ARENA_SIZE (64 * 1024)
 
+// Model quantization parameters - MOVE THESE HERE (not in header)
+const float MODEL_INPUT_SCALE = 0.11736483126878738f;
+const int MODEL_INPUT_ZERO_POINT = 2;
 const float OUTPUT_SCALE = 0.00390625f;
-const int   OUTPUT_ZERO_POINT = -128;
+const int OUTPUT_ZERO_POINT = -128;
 
-//Eloquent::TF::Sequential is the helper class wrapping TFML
-// 30 is the library limit, max number of nodes/ops/commands allowed by the wrapper
+// Detection threshold
+const float COUGH_THRESHOLD = 0.7f;
+
+// ======================= GLOBAL OBJECTS & BUFFERS =======================
 Eloquent::TF::Sequential<30, TENSOR_ARENA_SIZE> tf;
+AudioProcessor audioProcessor(I2S_BCK_PIN, I2S_WS_PIN, I2S_SD_PIN, I2S_PORT);
 
-AudioProcessor audio(I2S_SCK_PIN, I2S_WS_PIN, I2S_SD_PIN, I2S_NUM_0);
+// CRITICAL: Main audio buffer allocated in PSRAM
+float *g_audio_buffer_psram = nullptr;
+// Model input buffer allocated in PSRAM
+int8_t *g_model_input_buffer = nullptr;
 
+// ======================= FUNCTION DECLARATIONS =======================
+bool initializePSRAM();
+bool initializeModel();
+bool initializeAudioProcessor();
+void runInference();
+void printSystemStatus();
+
+// ======================= SETUP =======================
 void setup()
 {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n\n----- ESP32-S3 Cough Detection Model Integration -----\n");
 
-  // informs the wrapper how many input element and how many output classes are
+  // CRITICAL for ESP32-S3 USB Serial
+  while (!Serial)
+  {
+    delay(10);
+  }
+  delay(1000);
+
+  Serial.println("\n==================================================");
+  Serial.println("     ESP32-S3 REAL-TIME COUGH DETECTION SYSTEM");
+  Serial.println("==================================================");
+
+  // 1. Initialize PSRAM and allocate buffers
+  Serial.println("\n[1/3] Initializing PSRAM...");
+  if (!initializePSRAM())
+  {
+    Serial.println("❌ SYSTEM HALTED: PSRAM initialization failed.");
+    while (1)
+    {
+      delay(1000);
+    }
+  }
+
+  // CRITICAL: Connect PSRAM buffer to AudioProcessor
+  audioProcessor.setAudioBuffer(g_audio_buffer_psram);
+
+  // 2. Initialize TensorFlow Lite Model
+  Serial.println("\n[2/3] Initializing TensorFlow Lite Model...");
+  if (!initializeModel())
+  {
+    Serial.println("❌ SYSTEM HALTED: Model initialization failed.");
+    while (1)
+    {
+      delay(1000);
+    }
+  }
+
+  // 3. Initialize Audio Processor
+  Serial.println("\n[3/3] Initializing Audio Processor...");
+  if (!initializeAudioProcessor())
+  {
+    Serial.println("❌ SYSTEM HALTED: Audio processor initialization failed.");
+    while (1)
+    {
+      delay(1000);
+    }
+  }
+
+  // Print final system status
+  printSystemStatus();
+
+  Serial.println("\n✅ SYSTEM INITIALIZATION COMPLETE");
+  Serial.println("   Listening for audio...");
+  Serial.println("==================================================\n");
+}
+
+// ======================= MAIN LOOP =======================
+void loop()
+{
+  static unsigned long lastInferenceTime = 0;
+  static unsigned long lastStatusTime = 0;
+  const unsigned long INFERENCE_INTERVAL_MS = 1000; // Run every second
+  const unsigned long STATUS_INTERVAL_MS = 5000;    // Print status every 5s
+
+  unsigned long currentTime = millis();
+
+  // 1. Continuously read audio from I2S microphone
+  const int I2S_READ_BUFFER_SIZE = 512;
+  static int32_t i2sBuffer[I2S_READ_BUFFER_SIZE];
+
+  int samplesRead = audioProcessor.read(i2sBuffer, I2S_READ_BUFFER_SIZE);
+
+  // 2. Run inference at regular intervals
+  if (currentTime - lastInferenceTime >= INFERENCE_INTERVAL_MS)
+  {
+    lastInferenceTime = currentTime;
+
+    // Check if we have enough audio collected
+    if (audioProcessor.hasEnoughAudio())
+    {
+      Serial.printf("\n[%lu] Running inference...", currentTime / 1000);
+      runInference();
+    }
+    else
+    {
+      // Show collection progress
+      int percent = (audioProcessor._samples_collected * 100) / ANALYSIS_SAMPLES;
+      Serial.printf("\n[%lu] Collecting audio: %d%% (%d/%d samples)",
+                    currentTime / 1000,
+                    percent,
+                    audioProcessor._samples_collected,
+                    ANALYSIS_SAMPLES);
+    }
+  }
+
+  // 3. Periodically print system status
+  if (currentTime - lastStatusTime >= STATUS_INTERVAL_MS)
+  {
+    lastStatusTime = currentTime;
+    printSystemStatus();
+  }
+
+  // Small delay to prevent watchdog issues
+  delay(1);
+}
+
+// ======================= FUNCTION IMPLEMENTATIONS =======================
+
+bool initializePSRAM()
+{
+  Serial.println("--- PSRAM Initialization ---");
+
+  if (psramFound())
+  {
+    Serial.println("✅ PSRAM detected by system.");
+    Serial.printf("   Total PSRAM: %.2f MB\n", ESP.getPsramSize() / (1024.0 * 1024.0));
+
+    // 1. Allocate main audio buffer in PSRAM
+    size_t audio_buffer_bytes = ANALYSIS_SAMPLES * sizeof(float);
+    Serial.printf("Allocating audio buffer: %.2f MB...", audio_buffer_bytes / (1024.0 * 1024.0));
+
+    g_audio_buffer_psram = (float *)ps_malloc(audio_buffer_bytes);
+    if (g_audio_buffer_psram == nullptr)
+    {
+      Serial.println(" FAILED!");
+      return false;
+    }
+    Serial.println(" SUCCESS!");
+    memset(g_audio_buffer_psram, 0, audio_buffer_bytes);
+
+    // 2. Allocate model input buffer in PSRAM
+    size_t model_buffer_bytes = NUMBER_OF_INPUTS * sizeof(int8_t);
+    Serial.printf("Allocating model buffer: %.2f MB...", model_buffer_bytes / (1024.0 * 1024.0));
+
+    g_model_input_buffer = (int8_t *)ps_malloc(model_buffer_bytes);
+    if (g_model_input_buffer == nullptr)
+    {
+      Serial.println(" FAILED!");
+      free(g_audio_buffer_psram);
+      return false;
+    }
+    Serial.println(" SUCCESS!");
+    memset(g_model_input_buffer, 0, model_buffer_bytes);
+
+    Serial.printf("Free PSRAM after allocation: %.2f MB\n", ESP.getFreePsram() / (1024.0 * 1024.0));
+    return true;
+  }
+
+  Serial.println("❌ PSRAM NOT FOUND!");
+  return false;
+}
+
+bool initializeModel()
+{
+  // Configure the model wrapper
   tf.setNumInputs(NUMBER_OF_INPUTS);
   tf.setNumOutputs(2);
 
-
-  // Add...() calls register those ops so TFML knows how to execute the model
+  // Register all operations needed by your model
   tf.resolver.AddExpandDims();
   tf.resolver.AddReshape();
   tf.resolver.AddConv2D();
@@ -48,120 +214,110 @@ void setup()
   tf.resolver.AddFullyConnected();
   tf.resolver.AddSoftmax();
 
-  Serial.println("Loading model...");
-  // tf.begin() loads the .tflite and initializes the interpreter using the registered 
-  //ops and tensor arena
+  // Load the model
+  Serial.println("Loading TensorFlow Lite model...");
   auto status = tf.begin(cough_cnn_int8_tflite);
 
   if (!status.isOk())
   {
-    Serial.print("MODEL LOAD FAILED: ");
-    //this usually gives a clear reason (missing op, arena too small, etc.).
+    Serial.print("❌ Model load failed: ");
     Serial.println(status.toString());
-    while (1)
-      ;
+    return false;
   }
 
-  Serial.println("Model loaded successfully");
+  Serial.println("✅ Model loaded successfully");
+  Serial.printf("  Model size: %d bytes\n", cough_cnn_int8_tflite_len);
+  Serial.printf("  Tensor arena: %d bytes\n", TENSOR_ARENA_SIZE);
 
-  Serial.print("Model size: ");
-  Serial.print(cough_cnn_int8_tflite_len);
-  Serial.println(" bytes");
+  // Run a dummy inference to warm up
+  Serial.println("Warming up model with dummy inference...");
+  unsigned long startTime = micros();
+  auto predictStatus = tf.predict(g_model_input_buffer);
+  unsigned long warmupTime = micros() - startTime;
 
-  Serial.print("Tensor arena size: ");
-  Serial.print(TENSOR_ARENA_SIZE);
-  Serial.println(" bytes");
-
-
-  Serial.println("Starting microphone...");
-  if (!audio.begin(16000)) {
-    Serial.println("Audio start FAILED");
-    while (1);
+  if (!predictStatus.isOk())
+  {
+    Serial.print("❌ Warmup failed: ");
+    Serial.println(predictStatus.toString());
+    return false;
   }
-  Serial.println("Microphone started");
 
-  // ---------- Dummy inference ----------
-  // static int8_t dummyInput[NUMBER_OF_INPUTS] = {0};
-
-  // Serial.println("\nRunning inference...");
-
-  // unsigned long startTime = micros();
-  // auto predictStatus = tf.predict(dummyInput);
-  // unsigned long inferenceTime = micros() - startTime;
-
-  // if (!predictStatus.isOk())
-  // {
-  //   Serial.print("INFERENCE FAILED: ");
-  //   Serial.println(predictStatus.toString());
-  //   return;
-  // }
-
-  // Serial.print("Inference time: ");
-  // Serial.print(inferenceTime);
-  // Serial.println(" microseconds");
-
-  // int q0 = (int) round(tf.output(0));
-  // int q1 = (int) round(tf.output(1));
-
-  // // Dequantize to real probabilities
-  // float p0 = (q0 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
-  // float p1 = (q1 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
-
-  // Serial.print("Quantized output: ");
-  // Serial.print(q0);
-  // Serial.print(", ");
-  // Serial.println(q1);
-
-  // Serial.print("Probabilities: ");
-  // Serial.print(p0, 6);
-  // Serial.print(", ");
-  // Serial.println(p1, 6);
+  Serial.printf("✅ Model warmup complete: %lu µs\n", warmupTime);
+  return true;
 }
 
-void loop() {
-    static int32_t i2sBuffer[1024];
-    int samplesRead = audio.read(i2sBuffer, 1024);
-    
-    if (samplesRead > 0) {
-        // Analyze first 10 samples in detail
-        Serial.println("\n=== RAW I2S DATA ANALYSIS ===");
-        for (int i = 0; i < min(10, samplesRead); i++) {
-            uint32_t raw = (uint32_t)i2sBuffer[i];
-            // 1. Show raw 32-bit value
-            Serial.printf("Raw[%d]: 0x%08X", i, raw);
-            
-            // 2. Show as signed 32-bit integer
-            Serial.printf(" | Signed32: %d", (int32_t)raw);
-            
-            // 3. Extract the 24-bit audio part (shift right 8 bits)
-            int32_t audio24bit = (int32_t)(raw >> 8);
-            // Proper sign extension for 24-bit
-            if (audio24bit & 0x00800000) {
-                audio24bit |= 0xFF000000;
-            }
-            Serial.printf(" | Audio24: %d", audio24bit);
-            
-            // 4. Calculate DC offset (average of first 10)
-            static long long sum = 0;
-            static int count = 0;
-            if (i == 0) sum = 0, count = 0; // Reset each batch
-            sum += audio24bit;
-            count++;
-            
-            Serial.println();
-        }
-        
-        // Quick stats
-        int32_t minVal = INT32_MAX, maxVal = INT32_MIN;
-        for (int i = 0; i < samplesRead; i++) {
-            int32_t val = (int32_t)(i2sBuffer[i] >> 8);
-            if (val & 0x00800000) val |= 0xFF000000;
-            if (val < minVal) minVal = val;
-            if (val > maxVal) maxVal = val;
-        }
-        Serial.printf("Range: %d to %d (24-bit scale)\n", minVal, maxVal);
-        Serial.println("==============================\n");
-    }
-    
-    delay(2000); // Slow output for readability
+bool initializeAudioProcessor()
+{
+  Serial.println("Initializing I2S microphone and audio processor...");
+
+  if (!audioProcessor.begin(SAMPLE_RATE))
+  {
+    Serial.println("❌ Audio processor failed to initialize.");
+    return false;
+  }
+
+  Serial.println("✅ Audio processor initialized");
+  Serial.printf("  Sample rate: %d Hz\n", SAMPLE_RATE);
+  Serial.printf("  Analysis window: %d seconds\n", ANALYSIS_SECONDS);
+  Serial.printf("  Buffer samples: %d\n", ANALYSIS_SAMPLES);
+
+  return true;
+}
+
+void runInference()
+{
+  // 1. Extract MFCC features directly into PSRAM buffer
+  if (!audioProcessor.getMFCCFeatures(g_model_input_buffer))
+  {
+    Serial.println("❌ Failed to extract MFCC features.");
+    return;
+  }
+
+  // 2. Run inference
+  unsigned long startTime = micros();
+  auto predictStatus = tf.predict(g_model_input_buffer);
+  unsigned long inferenceTime = micros() - startTime;
+
+  if (!predictStatus.isOk())
+  {
+    Serial.print("❌ Inference failed: ");
+    Serial.println(predictStatus.toString());
+    return;
+  }
+
+  // 3. Dequantize and process results
+  int q0 = (int)round(tf.output(0));
+  int q1 = (int)round(tf.output(1));
+
+  // Dequantize
+  float p_cough = (q0 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
+  float p_non_cough = (q1 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
+
+  // 4. Display results
+  Serial.printf("  Inference time: %lu µs\n", inferenceTime);
+  Serial.printf("  Probabilities: [Cough: %.4f, Non-Cough: %.4f]\n",
+                p_cough, p_non_cough);
+
+  // 5. Detection logic
+  if (p_cough > COUGH_THRESHOLD)
+  {
+    Serial.println("  🚨🚨🚨 COUGH DETECTED! 🚨🚨🚨");
+
+    // Add your actions here
+  }
+}
+
+void printSystemStatus()
+{
+  Serial.println("\n--- SYSTEM STATUS ---");
+  Serial.printf("Uptime: %lu seconds\n", millis() / 1000);
+  Serial.printf("Audio collected: %d/%d samples\n",
+                audioProcessor._samples_collected, ANALYSIS_SAMPLES);
+  Serial.printf("Free Heap (Internal): %.2f KB\n", ESP.getFreeHeap() / 1024.0);
+  Serial.printf("Free PSRAM: %.2f KB\n", ESP.getFreePsram() / 1024.0);
+
+  // Optional: Audio statistics
+  float rms, peak, dc;
+  audioProcessor.getAudioStats(rms, peak, dc);
+  Serial.printf("Audio stats: RMS=%.4f, Peak=%.4f, DC=%.4f\n", rms, peak, dc);
 }
