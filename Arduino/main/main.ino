@@ -35,7 +35,7 @@ bool initializePSRAM();
 bool initializeModel();
 bool initializeAudioProcessor();
 void runInference();
-void printSystemStatus();
+// void printSystemStatus();
 
 // ======================= SETUP =======================
 void setup()
@@ -90,7 +90,7 @@ void setup()
   }
 
   // Print final system status
-  printSystemStatus();
+  // printSystemStatus();
 
   Serial.println("\n SYSTEM INITIALIZATION COMPLETE");
   Serial.println("   Listening for audio...");
@@ -103,7 +103,7 @@ void loop()
   static unsigned long lastInferenceTime = 0;
   static unsigned long lastStatusTime = 0;
   const unsigned long INFERENCE_INTERVAL_MS = 1000; // Run every second
-  const unsigned long STATUS_INTERVAL_MS = 5000;    // Print status every 5s
+  const unsigned long STATUS_INTERVAL_MS = 5000;    // Print status every 1s
 
   unsigned long currentTime = millis();
 
@@ -121,30 +121,30 @@ void loop()
     // Check if we have enough audio collected
     if (audioProcessor.hasEnoughAudio())
     {
-      Serial.printf("\n[%lu] Running inference...", currentTime / 1000);
+      // Serial.printf("\n[%lu] Running inference...", currentTime / 1000);
       runInference();
     }
     else
     {
       // Show collection progress
-      int percent = (audioProcessor._samples_collected * 100) / ANALYSIS_SAMPLES;
-      Serial.printf("\n[%lu] Collecting audio: %d%% (%d/%d samples)",
-                    currentTime / 1000,
-                    percent,
-                    audioProcessor._samples_collected,
-                    ANALYSIS_SAMPLES);
+      // int percent = (audioProcessor._samples_collected * 100) / ANALYSIS_SAMPLES;
+      // Serial.printf("\n[%lu] Collecting audio: %d%% (%d/%d samples)",
+      //               currentTime / 1000,
+      //               percent,
+      //               audioProcessor._samples_collected,
+      //               ANALYSIS_SAMPLES);
     }
   }
 
   // 3. Periodically print system status
-  if (currentTime - lastStatusTime >= STATUS_INTERVAL_MS)
-  {
-    lastStatusTime = currentTime;
-    printSystemStatus();
-  }
+  // if (currentTime - lastStatusTime >= STATUS_INTERVAL_MS)
+  // {
+  //   lastStatusTime = currentTime;
+  //   printSystemStatus();
+  // }
 
   // Small delay to prevent watchdog issues
-  delay(1);
+  // delay(1);
 }
 
 // ======================= FUNCTION IMPLEMENTATIONS =======================
@@ -262,10 +262,13 @@ bool initializeAudioProcessor()
 
 void runInference()
 {
+  // Timestamp (seconds since boot) for this inference
+  unsigned long t_seconds = millis() / 1000;
+
   // 1. Extract MFCC features directly into PSRAM buffer
   if (!audioProcessor.getMFCCFeatures(g_model_input_buffer))
   {
-    Serial.println(" Failed to extract MFCC features.");
+    Serial.printf("[%lus] Failed to extract MFCC features.\n", t_seconds);
     return;
   }
 
@@ -276,8 +279,7 @@ void runInference()
 
   if (!predictStatus.isOk())
   {
-    Serial.print(" Inference failed: ");
-    Serial.println(predictStatus.toString());
+    Serial.printf("[%lus] Inference failed: %s\n", t_seconds, predictStatus.toString().c_str());
     return;
   }
 
@@ -289,31 +291,30 @@ void runInference()
   float p_cough = (q0 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
   float p_non_cough = (q1 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
 
-  // 4. Display results
-  Serial.printf("  Inference time: %lu µs\n", inferenceTime);
-  Serial.printf("  Probabilities: [Cough: %.4f, Non-Cough: %.4f]\n",
-                p_cough, p_non_cough);
+  // 4. Display results with timestamp and inference time
+  Serial.printf("[%lus] Inference time: %lu µs, Probabilities: [Cough: %.4f, Non-Cough: %.4f]\n",
+                t_seconds, inferenceTime, p_cough, p_non_cough);
 
   // 5. Detection logic
   if (p_cough > COUGH_THRESHOLD)
   {
-    Serial.println("  ################################# COUGH DETECTED! #################################");
+    Serial.println("  ||||||||||||||||||||| COUGH DETECTED! |||||||||||||||||||||");
 
     // Add your actions here
   }
 }
 
-void printSystemStatus()
-{
-  Serial.println("\n--- SYSTEM STATUS ---");
-  Serial.printf("Uptime: %lu seconds\n", millis() / 1000);
-  Serial.printf("Audio collected: %d/%d samples\n",
-                audioProcessor._samples_collected, ANALYSIS_SAMPLES);
-  Serial.printf("Free Heap (Internal): %.2f KB\n", ESP.getFreeHeap() / 1024.0);
-  Serial.printf("Free PSRAM: %.2f KB\n", ESP.getFreePsram() / 1024.0);
+// void printSystemStatus()
+// {
+//   Serial.println("\n--- SYSTEM STATUS ---");
+//   Serial.printf("Uptime: %lu seconds\n", millis() / 1000);
+//   Serial.printf("Audio collected: %d/%d samples\n",
+//                 audioProcessor._samples_collected, ANALYSIS_SAMPLES);
+//   Serial.printf("Free Heap (Internal): %.2f KB\n", ESP.getFreeHeap() / 1024.0);
+//   Serial.printf("Free PSRAM: %.2f KB\n", ESP.getFreePsram() / 1024.0);
 
-  // Optional: Audio statistics
-  float rms, peak, dc;
-  audioProcessor.getAudioStats(rms, peak, dc);
-  Serial.printf("Audio stats: RMS=%.4f, Peak=%.4f, DC=%.4f\n", rms, peak, dc);
-}
+//   // Optional: Audio statistics
+//   float rms, peak, dc;
+//   audioProcessor.getAudioStats(rms, peak, dc);
+//   Serial.printf("Audio stats: RMS=%.4f, Peak=%.4f, DC=%.4f\n", rms, peak, dc);
+// }

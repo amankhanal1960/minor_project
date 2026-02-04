@@ -364,9 +364,9 @@ bool MFCCExtractor::extractMFCC(const float *audio, float *mfcc_output)
     // Standardize across all frames
     standardizeMFCCs(mfcc_output);
 
-    unsigned long processing_time = micros() - start_time;
-    Serial.printf("MFCC extraction: %lu µs (%.1f ms)\n",
-                  processing_time, processing_time / 1000.0f);
+    // unsigned long processing_time = micros() - start_time;
+    // Serial.printf("MFCC extraction: %lu µs (%.1f ms)\n",
+    //               processing_time, processing_time / 1000.0f);
 
     return true;
 }
@@ -585,7 +585,7 @@ bool AudioProcessor::getMFCCFeatures(int8_t *mfcc_output)
         return false;
     }
 
-    Serial.println("Extracting MFCCs from circular buffer...");
+    // Serial.println("Extracting MFCCs from circular buffer...");
     
     // Get the most recent 9 seconds of audio into a temporary buffer
     float* recent_audio = (float*)malloc(ANALYSIS_SAMPLES * sizeof(float));
@@ -620,13 +620,6 @@ bool AudioProcessor::getMFCCFeatures(int8_t *mfcc_output)
     if (success) {
         // Quantize to int8
         quantizeMFCC(mfcc_float, mfcc_output);
-        
-        // Debug: print first few values
-        Serial.print("First 5 quantized MFCCs: ");
-        for (int i = 0; i < 5; i++) {
-            Serial.printf("%d ", mfcc_output[i]);
-        }
-        Serial.println();
     } else {
         Serial.println("MFCC extraction failed");
     }
