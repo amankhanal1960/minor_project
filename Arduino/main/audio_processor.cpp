@@ -3,8 +3,16 @@
 
 // ===== MFCC EXTRACTOR IMPLEMENTATION =====
 MFCCExtractor::MFCCExtractor()
-    : window(nullptr), mel_filters(nullptr), dct_matrix(nullptr),
-      buffer_head(0), buffer_ready(false),
+    : window(nullptr),
+      mel_filters(nullptr),
+      dct_matrix(nullptr),
+      _frame_data(nullptr),
+      _processed_frame(nullptr),
+      _spectrum(nullptr),
+      _mel_energies(nullptr),
+      _frame_mfcc(nullptr),
+      buffer_head(0),
+      buffer_ready(false),
       fft(vReal, vImag, N_FFT, SAMPLE_RATE) // Initialize FFT here
 {
     memset(mfcc_buffer, 0, sizeof(mfcc_buffer));
@@ -20,6 +28,16 @@ MFCCExtractor::~MFCCExtractor()
         free(mel_filters);
     if (dct_matrix)
         free(dct_matrix);
+    if (_frame_data)
+        free(_frame_data);
+    if (_processed_frame)
+        free(_processed_frame);
+    if (_spectrum)
+        free(_spectrum);
+    if (_mel_energies)
+        free(_mel_energies);
+    if (_frame_mfcc)
+        free(_frame_mfcc);
     // No need to delete fft - it's not a pointer
 }
 
@@ -63,6 +81,47 @@ bool MFCCExtractor::begin()
         return false;
     }
     createDCTMatrix();
+
+    // Allocate working buffers on heap instead of stack to avoid
+    // overflowing the Arduino loop task stack on ESP32-S3.
+    int half_fft = N_FFT / 2 + 1;
+
+    _frame_data = (float *)malloc(N_FFT * sizeof(float));
+    _processed_frame = (float *)malloc(N_FFT * sizeof(float));
+    _spectrum = (float *)malloc(half_fft * sizeof(float));
+    _mel_energies = (float *)malloc(NUM_MEL_FILTERS * sizeof(float));
+    _frame_mfcc = (float *)malloc(NUM_MFCCS * sizeof(float));
+
+    if (!_frame_data || !_processed_frame || !_spectrum || !_mel_energies || !_frame_mfcc)
+    {
+        Serial.println("Failed to allocate MFCC working buffers");
+
+        if (_frame_data)
+            free(_frame_data);
+        if (_processed_frame)
+            free(_processed_frame);
+        if (_spectrum)
+            free(_spectrum);
+        if (_mel_energies)
+            free(_mel_energies);
+        if (_frame_mfcc)
+            free(_frame_mfcc);
+
+        _frame_data = nullptr;
+        _processed_frame = nullptr;
+        _spectrum = nullptr;
+        _mel_energies = nullptr;
+        _frame_mfcc = nullptr;
+
+        free(window);
+        window = nullptr;
+        free(mel_filters);
+        mel_filters = nullptr;
+        free(dct_matrix);
+        dct_matrix = nullptr;
+
+        return false;
+    }
 
     // Initialize circular buffer
     resetBuffer();
@@ -157,25 +216,24 @@ void MFCCExtractor::processFrame(const float *frame, float *mfcc_output)
 {
     // Apply pre-emphasis (librosa default: α=0.97)
     static const float PREEMPHASIS = 0.97f;
-    float processed_frame[N_FFT];
 
     // Pre-emphasis
-    processed_frame[0] = frame[0] * (1.0f - PREEMPHASIS);
+    _processed_frame[0] = frame[0] * (1.0f - PREEMPHASIS);
     for (int i = 1; i < N_FFT; i++)
     {
-        processed_frame[i] = frame[i] - PREEMPHASIS * frame[i - 1];
+        _processed_frame[i] = frame[i] - PREEMPHASIS * frame[i - 1];
     }
 
     // Apply window
     for (int i = 0; i < N_FFT; i++)
     {
-        processed_frame[i] *= window[i];
+        _processed_frame[i] *= window[i];
     }
 
     // Copy to FFT input buffers
     for (int i = 0; i < N_FFT; i++)
     {
-        vReal[i] = (double)processed_frame[i];
+        vReal[i] = (double)_processed_frame[i];
         vImag[i] = 0.0;
     }
 
@@ -187,29 +245,27 @@ void MFCCExtractor::processFrame(const float *frame, float *mfcc_output)
 
     // Compute power spectrum (magnitude squared)
     int half_fft = N_FFT / 2 + 1;
-    float spectrum[half_fft];
     for (int k = 0; k < half_fft; k++)
     {
         double magnitude = vReal[k];
-        spectrum[k] = (float)(magnitude * magnitude);
+        _spectrum[k] = (float)(magnitude * magnitude);
 
         // Add epsilon to avoid log(0)
-        if (spectrum[k] < 1e-10f)
-            spectrum[k] = 1e-10f;
+        if (_spectrum[k] < 1e-10f)
+            _spectrum[k] = 1e-10f;
     }
 
     // Apply mel filterbank
-    float mel_energies[NUM_MEL_FILTERS];
-    memset(mel_energies, 0, NUM_MEL_FILTERS * sizeof(float));
+    memset(_mel_energies, 0, NUM_MEL_FILTERS * sizeof(float));
 
     for (int m = 0; m < NUM_MEL_FILTERS; m++)
     {
         for (int k = 0; k < half_fft; k++)
         {
-            mel_energies[m] += spectrum[k] * mel_filters[m * half_fft + k];
+            _mel_energies[m] += _spectrum[k] * mel_filters[m * half_fft + k];
         }
         // Natural log (librosa uses natural log for DCT)
-        mel_energies[m] = logf(mel_energies[m]);
+        _mel_energies[m] = logf(_mel_energies[m]);
     }
 
     // Apply DCT to get MFCCs
@@ -218,7 +274,7 @@ void MFCCExtractor::processFrame(const float *frame, float *mfcc_output)
         mfcc_output[i] = 0.0f;
         for (int j = 0; j < NUM_MEL_FILTERS; j++)
         {
-            mfcc_output[i] += mel_energies[j] * dct_matrix[i * NUM_MEL_FILTERS + j];
+            mfcc_output[i] += _mel_energies[j] * dct_matrix[i * NUM_MEL_FILTERS + j];
         }
     }
 }
@@ -270,14 +326,16 @@ void MFCCExtractor::standardizeMFCCs(float *mfccs)
 bool MFCCExtractor::extractMFCC(const float *audio, float *mfcc_output)
 {
     // Verify input length (must be exactly 9 seconds)
-    int expected_samples = ANALYSIS_SAMPLES; // 144000
+    int expected_samples = N_FFT + (NUM_FRAMES - 1) * HOP_LENGTH; // 144000
     int actual_samples = N_FFT + (NUM_FRAMES - 1) * HOP_LENGTH;
 
-    if (actual_samples != expected_samples)
-    {
-        Serial.printf("ERROR: Need %d samples for %d frames, got %d\n",
-                      expected_samples, NUM_FRAMES, actual_samples);
-        return false;
+    int max_frames = (ANALYSIS_SAMPLES - N_FFT) / HOP_LENGTH + 1;
+    
+    if (max_frames < NUM_FRAMES) {
+        Serial.printf("Warning: Only %d frames available, need %d\n", 
+                     max_frames, NUM_FRAMES);
+        // Process what we can
+        max_frames = min(max_frames, NUM_FRAMES);
     }
 
     unsigned long start_time = micros();
@@ -288,20 +346,18 @@ bool MFCCExtractor::extractMFCC(const float *audio, float *mfcc_output)
         int start_sample = frame * HOP_LENGTH;
 
         // Extract frame and process
-        float frame_data[N_FFT];
         for (int i = 0; i < N_FFT; i++)
         {
-            frame_data[i] = audio[start_sample + i];
+            _frame_data[i] = audio[start_sample + i];
         }
 
         // Get MFCC for this frame
-        float frame_mfcc[NUM_MFCCS];
-        processFrame(frame_data, frame_mfcc);
+        processFrame(_frame_data, _frame_mfcc);
 
         // Store in output array
         for (int c = 0; c < NUM_MFCCS; c++)
         {
-            mfcc_output[frame * NUM_MFCCS + c] = frame_mfcc[c];
+            mfcc_output[frame * NUM_MFCCS + c] = _frame_mfcc[c];
         }
     }
 
@@ -370,10 +426,12 @@ void MFCCExtractor::getCurrentMFCC(float *mfcc_output)
 }
 
 // ===== AUDIO PROCESSOR IMPLEMENTATION =====
-AudioProcessor::AudioProcessor(int bckPin, int wsPin, int sdPin, i2s_port_t port)
+AudioProcessor::AudioProcessor(int bckPin, int wsPin, int sdPin,
+ float input_scale, int input_zero_point, i2s_port_t port)
     : _audio_buffer(nullptr), _i2sPort(port), _sampleRate(0),
       _write_index(0), _samples_collected(0),
-      _frame_position(0), _hop_counter(0)
+      _frame_position(0), _hop_counter(0),
+      _input_scale(input_scale), _input_zero_point(input_zero_point)
 {
     _pinConfig.bck_io_num = bckPin;
     _pinConfig.ws_io_num = wsPin;
@@ -465,8 +523,8 @@ void AudioProcessor::quantizeMFCC(const float *mfcc_float, int8_t *mfcc_int8)
     for (int i = 0; i < NUM_INPUTS; i++)
     {
         // Formula: quantized = round(value / scale + zero_point)
-        float scaled = mfcc_float[i] / MODEL_INPUT_SCALE;
-        int32_t quantized = (int32_t)roundf(scaled + MODEL_INPUT_ZERO_POINT);
+        float scaled = mfcc_float[i] / _input_scale;
+        int32_t quantized = (int32_t)roundf(scaled + _input_zero_point);
 
         // Clamp to int8 range (safety)
         if (quantized > 127)
@@ -527,43 +585,57 @@ bool AudioProcessor::getMFCCFeatures(int8_t *mfcc_output)
         return false;
     }
 
-    // Get the most recent 9 seconds of audio
-    float recent_audio[ANALYSIS_SAMPLES];
-
+    Serial.println("Extracting MFCCs from circular buffer...");
+    
+    // Get the most recent 9 seconds of audio into a temporary buffer
+    float* recent_audio = (float*)malloc(ANALYSIS_SAMPLES * sizeof(float));
+    if (!recent_audio) {
+        Serial.println("Failed to allocate temporary audio buffer!");
+        return false;
+    }
+    
     // Calculate start index (9 seconds before current write position)
     int start_idx = _write_index - ANALYSIS_SAMPLES;
-    if (start_idx < 0)
-    {
+    if (start_idx < 0) {
         start_idx += BUFFER_SAMPLES;
     }
-
-    // Copy audio from circular buffer
-    for (int i = 0; i < ANALYSIS_SAMPLES; i++)
-    {
+    
+    // Copy audio from circular buffer to temporary buffer
+    for (int i = 0; i < ANALYSIS_SAMPLES; i++) {
         int idx = (start_idx + i) % BUFFER_SAMPLES;
         recent_audio[i] = _audio_buffer[idx];
     }
-
-    // Extract MFCC features (float, standardized)
-    float mfcc_float[NUM_INPUTS];
-    if (!_mfcc_extractor.extractMFCC(recent_audio, mfcc_float))
-    {
-        Serial.println("MFCC extraction failed");
+    
+    // Temporary buffer for MFCCs (float)
+    float* mfcc_float = (float*)malloc(NUM_INPUTS * sizeof(float));
+    if (!mfcc_float) {
+        Serial.println("Failed to allocate MFCC float buffer!");
+        free(recent_audio);
         return false;
     }
-
-    // Quantize to int8
-    quantizeMFCC(mfcc_float, mfcc_output);
-
-    // Debug: print first few values
-    Serial.print("First 5 quantized MFCCs: ");
-    for (int i = 0; i < 5; i++)
-    {
-        Serial.printf("%d ", mfcc_output[i]);
+    
+    // Extract MFCC features (extractMFCC does both extraction AND standardization)
+    bool success = _mfcc_extractor.extractMFCC(recent_audio, mfcc_float);
+    
+    if (success) {
+        // Quantize to int8
+        quantizeMFCC(mfcc_float, mfcc_output);
+        
+        // Debug: print first few values
+        Serial.print("First 5 quantized MFCCs: ");
+        for (int i = 0; i < 5; i++) {
+            Serial.printf("%d ", mfcc_output[i]);
+        }
+        Serial.println();
+    } else {
+        Serial.println("MFCC extraction failed");
     }
-    Serial.println();
-
-    return true;
+    
+    // Cleanup
+    free(recent_audio);
+    free(mfcc_float);
+    
+    return success;
 }
 
 bool AudioProcessor::getMFCCFeaturesFromAudio(const float *audio, int audio_length, int8_t *mfcc_output)
@@ -575,17 +647,25 @@ bool AudioProcessor::getMFCCFeaturesFromAudio(const float *audio, int audio_leng
         return false;
     }
 
-    // Extract MFCC features
-    float mfcc_float[NUM_INPUTS];
-    if (!_mfcc_extractor.extractMFCC(audio, mfcc_float))
+    // Extract MFCC features into heap buffer to avoid large stack allocation
+    float *mfcc_float = (float *)malloc(NUM_INPUTS * sizeof(float));
+    if (!mfcc_float)
     {
+        Serial.println("Failed to allocate MFCC float buffer (getMFCCFeaturesFromAudio)");
         return false;
     }
 
-    // Quantize to int8
-    quantizeMFCC(mfcc_float, mfcc_output);
+    bool ok = _mfcc_extractor.extractMFCC(audio, mfcc_float);
 
-    return true;
+    if (ok)
+    {
+        // Quantize to int8
+        quantizeMFCC(mfcc_float, mfcc_output);
+    }
+
+    free(mfcc_float);
+
+    return ok;
 }
 
 void AudioProcessor::processIncremental(const int32_t *i2s_samples, int count)

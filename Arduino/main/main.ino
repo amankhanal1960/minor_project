@@ -1,5 +1,6 @@
-#include <eloquent_tinyml.h>
 #include <Arduino.h>
+#include <tflm_esp32.h>
+#include <eloquent_tinyml.h>
 #include "model_data.h"
 #include "audio_processor.h"
 
@@ -9,13 +10,6 @@
 #define I2S_SD_PIN 20
 #define I2S_PORT I2S_NUM_0
 
-// ======================= AUDIO/MODEL CONSTANTS =======================
-#define SAMPLE_RATE 16000
-#define ANALYSIS_SECONDS 9
-#define ANALYSIS_SAMPLES (SAMPLE_RATE * ANALYSIS_SECONDS) // 144000
-#define NUMBER_OF_INPUTS 11200                            // 280 frames * 40 MFCCs
-#define TENSOR_ARENA_SIZE (64 * 1024)
-
 // Model quantization parameters - MOVE THESE HERE (not in header)
 const float MODEL_INPUT_SCALE = 0.11736483126878738f;
 const int MODEL_INPUT_ZERO_POINT = 2;
@@ -24,10 +18,12 @@ const int OUTPUT_ZERO_POINT = -128;
 
 // Detection threshold
 const float COUGH_THRESHOLD = 0.7f;
+#define TENSOR_ARENA_SIZE (64 * 1024)
+
 
 // ======================= GLOBAL OBJECTS & BUFFERS =======================
 Eloquent::TF::Sequential<30, TENSOR_ARENA_SIZE> tf;
-AudioProcessor audioProcessor(I2S_BCK_PIN, I2S_WS_PIN, I2S_SD_PIN, I2S_PORT);
+AudioProcessor audioProcessor(I2S_BCK_PIN, I2S_WS_PIN, I2S_SD_PIN,MODEL_INPUT_SCALE, MODEL_INPUT_ZERO_POINT, I2S_PORT);
 
 // CRITICAL: Main audio buffer allocated in PSRAM
 float *g_audio_buffer_psram = nullptr;
@@ -61,7 +57,7 @@ void setup()
   Serial.println("\n[1/3] Initializing PSRAM...");
   if (!initializePSRAM())
   {
-    Serial.println("❌ SYSTEM HALTED: PSRAM initialization failed.");
+    Serial.println(" SYSTEM HALTED: PSRAM initialization failed.");
     while (1)
     {
       delay(1000);
@@ -75,7 +71,7 @@ void setup()
   Serial.println("\n[2/3] Initializing TensorFlow Lite Model...");
   if (!initializeModel())
   {
-    Serial.println("❌ SYSTEM HALTED: Model initialization failed.");
+    Serial.println(" SYSTEM HALTED: Model initialization failed.");
     while (1)
     {
       delay(1000);
@@ -86,7 +82,7 @@ void setup()
   Serial.println("\n[3/3] Initializing Audio Processor...");
   if (!initializeAudioProcessor())
   {
-    Serial.println("❌ SYSTEM HALTED: Audio processor initialization failed.");
+    Serial.println(" SYSTEM HALTED: Audio processor initialization failed.");
     while (1)
     {
       delay(1000);
@@ -96,7 +92,7 @@ void setup()
   // Print final system status
   printSystemStatus();
 
-  Serial.println("\n✅ SYSTEM INITIALIZATION COMPLETE");
+  Serial.println("\n SYSTEM INITIALIZATION COMPLETE");
   Serial.println("   Listening for audio...");
   Serial.println("==================================================\n");
 }
@@ -159,7 +155,7 @@ bool initializePSRAM()
 
   if (psramFound())
   {
-    Serial.println("✅ PSRAM detected by system.");
+    Serial.println(" PSRAM detected by system.");
     Serial.printf("   Total PSRAM: %.2f MB\n", ESP.getPsramSize() / (1024.0 * 1024.0));
 
     // 1. Allocate main audio buffer in PSRAM
@@ -176,7 +172,7 @@ bool initializePSRAM()
     memset(g_audio_buffer_psram, 0, audio_buffer_bytes);
 
     // 2. Allocate model input buffer in PSRAM
-    size_t model_buffer_bytes = NUMBER_OF_INPUTS * sizeof(int8_t);
+    size_t model_buffer_bytes = NUM_INPUTS * sizeof(int8_t);
     Serial.printf("Allocating model buffer: %.2f MB...", model_buffer_bytes / (1024.0 * 1024.0));
 
     g_model_input_buffer = (int8_t *)ps_malloc(model_buffer_bytes);
@@ -193,14 +189,14 @@ bool initializePSRAM()
     return true;
   }
 
-  Serial.println("❌ PSRAM NOT FOUND!");
+  Serial.println(" PSRAM NOT FOUND!");
   return false;
 }
 
 bool initializeModel()
 {
   // Configure the model wrapper
-  tf.setNumInputs(NUMBER_OF_INPUTS);
+  tf.setNumInputs(NUM_INPUTS);
   tf.setNumOutputs(2);
 
   // Register all operations needed by your model
@@ -220,12 +216,12 @@ bool initializeModel()
 
   if (!status.isOk())
   {
-    Serial.print("❌ Model load failed: ");
+    Serial.print(" Model load failed: ");
     Serial.println(status.toString());
     return false;
   }
 
-  Serial.println("✅ Model loaded successfully");
+  Serial.println(" Model loaded successfully");
   Serial.printf("  Model size: %d bytes\n", cough_cnn_int8_tflite_len);
   Serial.printf("  Tensor arena: %d bytes\n", TENSOR_ARENA_SIZE);
 
@@ -237,12 +233,12 @@ bool initializeModel()
 
   if (!predictStatus.isOk())
   {
-    Serial.print("❌ Warmup failed: ");
+    Serial.print(" Warmup failed: ");
     Serial.println(predictStatus.toString());
     return false;
   }
 
-  Serial.printf("✅ Model warmup complete: %lu µs\n", warmupTime);
+  Serial.printf(" Model warmup complete: %lu µs\n", warmupTime);
   return true;
 }
 
@@ -252,11 +248,11 @@ bool initializeAudioProcessor()
 
   if (!audioProcessor.begin(SAMPLE_RATE))
   {
-    Serial.println("❌ Audio processor failed to initialize.");
+    Serial.println(" Audio processor failed to initialize.");
     return false;
   }
 
-  Serial.println("✅ Audio processor initialized");
+  Serial.println(" Audio processor initialized");
   Serial.printf("  Sample rate: %d Hz\n", SAMPLE_RATE);
   Serial.printf("  Analysis window: %d seconds\n", ANALYSIS_SECONDS);
   Serial.printf("  Buffer samples: %d\n", ANALYSIS_SAMPLES);
@@ -269,7 +265,7 @@ void runInference()
   // 1. Extract MFCC features directly into PSRAM buffer
   if (!audioProcessor.getMFCCFeatures(g_model_input_buffer))
   {
-    Serial.println("❌ Failed to extract MFCC features.");
+    Serial.println(" Failed to extract MFCC features.");
     return;
   }
 
@@ -280,7 +276,7 @@ void runInference()
 
   if (!predictStatus.isOk())
   {
-    Serial.print("❌ Inference failed: ");
+    Serial.print(" Inference failed: ");
     Serial.println(predictStatus.toString());
     return;
   }
@@ -301,7 +297,7 @@ void runInference()
   // 5. Detection logic
   if (p_cough > COUGH_THRESHOLD)
   {
-    Serial.println("  🚨🚨🚨 COUGH DETECTED! 🚨🚨🚨");
+    Serial.println("  ################################# COUGH DETECTED! #################################");
 
     // Add your actions here
   }

@@ -15,10 +15,12 @@
 #define ANALYSIS_SECONDS 9
 #define BUFFER_SECONDS 10
 #define BUFFER_SAMPLES (SAMPLE_RATE * BUFFER_SECONDS)
-#define ANALYSIS_SAMPLES (SAMPLE_RATE * ANALYSIS_SECONDS)
 
-// Calculating the expected frames: (total_samples - n_fft) / hop_length + 1
-#define NUM_FRAMES ((ANALYSIS_SAMPLES - N_FFT) / HOP_LENGTH + 1)
+#define NUM_FRAMES 280
+
+#define ANALYSIS_SAMPLES (N_FFT + (NUM_FRAMES - 1) * HOP_LENGTH) 
+#define ANALYSIS_SECONDS_FLOAT (ANALYSIS_SAMPLES / (float)SAMPLE_RATE)  
+
 #define NUM_INPUTS (NUM_FRAMES * NUM_MFCCS) // 280 * 40
 
 // Model quantization parameters (from python model)
@@ -32,8 +34,8 @@ class MFCCExtractor
 public:
     MFCCExtractor();
     ~MFCCExtractor();
-
-    // Initializes FFT, window, Mel filterbank, DCT matrix.
+    
+    // Initializes FFT, window, Mel filterbank, DCT matrix, and working buffers.
     bool begin();
 
     // Extract the mfcc from 9 second audio (144000 samples)
@@ -52,6 +54,13 @@ private:
     // Mel filterbank and DCT matrix
     float *mel_filters; // [NUM_MEL_FILTERS x (N_FFT/2 + 1)]
     float *dct_matrix;  // [NUM_MFCCS x NUM_MEL_FILTERS]
+
+    // Working buffers moved off the stack to avoid overflow on ESP32-S3
+    float *_frame_data;      // [N_FFT]
+    float *_processed_frame; // [N_FFT]
+    float *_spectrum;        // [N_FFT/2 + 1]
+    float *_mel_energies;    // [NUM_MEL_FILTERS]
+    float *_frame_mfcc;      // [NUM_MFCCS]
 
     // FFT buffers
     double vReal[N_FFT];
@@ -86,7 +95,8 @@ private:
 class AudioProcessor
 {
 public:
-    AudioProcessor(int bckPin, int wsPin, int sdPin, i2s_port_t port = I2S_NUM_0);
+    AudioProcessor(int bckPin, int wsPin, int sdPin,float input_scale = 0.11736483126878738f,
+                   int input_zero_point = 2, i2s_port_t port = I2S_NUM_0);
     ~AudioProcessor();
     // Initialize I2S and audio processing
     bool begin(int sampleRate = 16000);
@@ -122,6 +132,8 @@ private:
     i2s_pin_config_t _pinConfig;
     i2s_port_t _i2sPort;
     int _sampleRate;
+    float _input_scale;
+    int _input_zero_point;
 
     // Audio buffer (circular)
     float* _audio_buffer; 
