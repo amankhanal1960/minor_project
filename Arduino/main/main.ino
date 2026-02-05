@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <tflm_esp32.h>
 #include <eloquent_tinyml.h>
-#include "model_data.h"
+#include "model_data1.h"
 #include "audio_processor.h"
 
 // ======================= HARDWARE CONFIG =======================
@@ -212,7 +212,7 @@ bool initializeModel()
 
   // Load the model
   Serial.println("Loading TensorFlow Lite model...");
-  auto status = tf.begin(cough_cnn_int8_tflite);
+  auto status = tf.begin(cough_cnn1_int8_tflite);
 
   if (!status.isOk())
   {
@@ -222,7 +222,7 @@ bool initializeModel()
   }
 
   Serial.println(" Model loaded successfully");
-  Serial.printf("  Model size: %d bytes\n", cough_cnn_int8_tflite_len);
+  Serial.printf("  Model size: %d bytes\n", cough_cnn1_int8_tflite_len);
   Serial.printf("  Tensor arena: %d bytes\n", TENSOR_ARENA_SIZE);
 
   // Run a dummy inference to warm up

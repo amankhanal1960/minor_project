@@ -40,7 +40,7 @@ MFCCExtractor::~MFCCExtractor()
         free(_frame_mfcc);
     // No need to delete fft - it's not a pointer
 }
-
+// calls createMelFilterBank() and createDCTMatrix()
 bool MFCCExtractor::begin()
 {
     Serial.println("Initializing MFCC Extractor...");
@@ -131,6 +131,7 @@ bool MFCCExtractor::begin()
     return true;
 }
 
+// Creation of mel fiterbank
 void MFCCExtractor::createMelFilterBank()
 {
     // Librosa default: 0Hz to sr/2 (8000Hz)
@@ -186,6 +187,7 @@ void MFCCExtractor::createMelFilterBank()
     Serial.println("Mel filterbank created");
 }
 
+// creation of DCT matrix
 void MFCCExtractor::createDCTMatrix()
 {
     // Librosa uses DCT type II with ortho normalization
@@ -212,6 +214,7 @@ void MFCCExtractor::createDCTMatrix()
     Serial.println("DCT matrix created");
 }
 
+// Full 9-second audio → MFCCs. The core pipeline.
 void MFCCExtractor::processFrame(const float *frame, float *mfcc_output)
 {
     // Apply pre-emphasis (librosa default: α=0.97)
@@ -279,6 +282,7 @@ void MFCCExtractor::processFrame(const float *frame, float *mfcc_output)
     }
 }
 
+// standardization of MFCC
 void MFCCExtractor::standardizeMFCCs(float *mfccs)
 {
     // Per-coefficient standardization across all frames
@@ -323,6 +327,7 @@ void MFCCExtractor::standardizeMFCCs(float *mfccs)
     }
 }
 
+// function to extract the mfcc, it uses processframe() and standardizemfcc()
 bool MFCCExtractor::extractMFCC(const float *audio, float *mfcc_output)
 {
     // Verify input length (must be exactly 9 seconds)
@@ -330,10 +335,11 @@ bool MFCCExtractor::extractMFCC(const float *audio, float *mfcc_output)
     int actual_samples = N_FFT + (NUM_FRAMES - 1) * HOP_LENGTH;
 
     int max_frames = (ANALYSIS_SAMPLES - N_FFT) / HOP_LENGTH + 1;
-    
-    if (max_frames < NUM_FRAMES) {
-        Serial.printf("Warning: Only %d frames available, need %d\n", 
-                     max_frames, NUM_FRAMES);
+
+    if (max_frames < NUM_FRAMES)
+    {
+        Serial.printf("Warning: Only %d frames available, need %d\n",
+                      max_frames, NUM_FRAMES);
         // Process what we can
         max_frames = min(max_frames, NUM_FRAMES);
     }
@@ -427,7 +433,7 @@ void MFCCExtractor::getCurrentMFCC(float *mfcc_output)
 
 // ===== AUDIO PROCESSOR IMPLEMENTATION =====
 AudioProcessor::AudioProcessor(int bckPin, int wsPin, int sdPin,
- float input_scale, int input_zero_point, i2s_port_t port)
+                               float input_scale, int input_zero_point, i2s_port_t port)
     : _audio_buffer(nullptr), _i2sPort(port), _sampleRate(0),
       _write_index(0), _samples_collected(0),
       _frame_position(0), _hop_counter(0),
@@ -586,48 +592,55 @@ bool AudioProcessor::getMFCCFeatures(int8_t *mfcc_output)
     }
 
     // Serial.println("Extracting MFCCs from circular buffer...");
-    
+
     // Get the most recent 9 seconds of audio into a temporary buffer
-    float* recent_audio = (float*)malloc(ANALYSIS_SAMPLES * sizeof(float));
-    if (!recent_audio) {
+    float *recent_audio = (float *)malloc(ANALYSIS_SAMPLES * sizeof(float));
+    if (!recent_audio)
+    {
         Serial.println("Failed to allocate temporary audio buffer!");
         return false;
     }
-    
+
     // Calculate start index (9 seconds before current write position)
     int start_idx = _write_index - ANALYSIS_SAMPLES;
-    if (start_idx < 0) {
+    if (start_idx < 0)
+    {
         start_idx += BUFFER_SAMPLES;
     }
-    
+
     // Copy audio from circular buffer to temporary buffer
-    for (int i = 0; i < ANALYSIS_SAMPLES; i++) {
+    for (int i = 0; i < ANALYSIS_SAMPLES; i++)
+    {
         int idx = (start_idx + i) % BUFFER_SAMPLES;
         recent_audio[i] = _audio_buffer[idx];
     }
-    
+
     // Temporary buffer for MFCCs (float)
-    float* mfcc_float = (float*)malloc(NUM_INPUTS * sizeof(float));
-    if (!mfcc_float) {
+    float *mfcc_float = (float *)malloc(NUM_INPUTS * sizeof(float));
+    if (!mfcc_float)
+    {
         Serial.println("Failed to allocate MFCC float buffer!");
         free(recent_audio);
         return false;
     }
-    
+
     // Extract MFCC features (extractMFCC does both extraction AND standardization)
     bool success = _mfcc_extractor.extractMFCC(recent_audio, mfcc_float);
-    
-    if (success) {
+
+    if (success)
+    {
         // Quantize to int8
         quantizeMFCC(mfcc_float, mfcc_output);
-    } else {
+    }
+    else
+    {
         Serial.println("MFCC extraction failed");
     }
-    
+
     // Cleanup
     free(recent_audio);
     free(mfcc_float);
-    
+
     return success;
 }
 
