@@ -5,9 +5,23 @@
 #include "audio_processor.h"
 
 // ======================= HARDWARE CONFIG =======================
-#define I2S_BCK_PIN 18
-#define I2S_WS_PIN 19
-#define I2S_SD_PIN 20
+// IMPORTANT: These GPIO numbers must match your physical wiring!
+// On ESP32-S3, GPIO labels on PCB may differ from actual GPIO numbers.
+// Check your board's pinout diagram to find which physical pins correspond
+// to these GPIO numbers, then wire INMP441 accordingly:
+//   INMP441 SCK -> GPIO I2S_BCK_PIN
+//   INMP441 WS  -> GPIO I2S_WS_PIN  
+//   INMP441 SD  -> GPIO I2S_SD_PIN
+//   INMP441 L/R -> GND
+//   INMP441 VCC -> 3.3V
+//   INMP441 GND -> GND
+//
+// Common safe GPIOs for I2S on ESP32-S3 (avoid GPIO 0, 3, 45, 46 which are strapping pins):
+// GPIO 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, etc.
+// Update these to match your actual wiring:
+#define I2S_BCK_PIN 18   // Bit clock - connect to INMP441 SCK
+#define I2S_WS_PIN  19   // Word select - connect to INMP441 WS
+#define I2S_SD_PIN  20   // Serial data - connect to INMP441 SD
 #define I2S_PORT I2S_NUM_0
 
 // Model quantization parameters - MOVE THESE HERE (not in header)
@@ -20,10 +34,9 @@ const int OUTPUT_ZERO_POINT = -128;
 const float COUGH_THRESHOLD = 0.7f;
 #define TENSOR_ARENA_SIZE (64 * 1024)
 
-
 // ======================= GLOBAL OBJECTS & BUFFERS =======================
 Eloquent::TF::Sequential<30, TENSOR_ARENA_SIZE> tf;
-AudioProcessor audioProcessor(I2S_BCK_PIN, I2S_WS_PIN, I2S_SD_PIN,MODEL_INPUT_SCALE, MODEL_INPUT_ZERO_POINT, I2S_PORT);
+AudioProcessor audioProcessor(I2S_BCK_PIN, I2S_WS_PIN, I2S_SD_PIN, MODEL_INPUT_SCALE, MODEL_INPUT_ZERO_POINT, I2S_PORT);
 
 // CRITICAL: Main audio buffer allocated in PSRAM
 float *g_audio_buffer_psram = nullptr;
@@ -152,45 +165,109 @@ void loop()
 bool initializePSRAM()
 {
   Serial.println("--- PSRAM Initialization ---");
+  
+  // Diagnostic: Check chip info
+  Serial.printf("Chip model: %s\n", ESP.getChipModel());
+  Serial.printf("Chip revision: %d\n", ESP.getChipRevision());
+  Serial.printf("Free heap before allocation: %.2f KB\n", ESP.getFreeHeap() / 1024.0);
 
   if (psramFound())
   {
     Serial.println(" PSRAM detected by system.");
     Serial.printf("   Total PSRAM: %.2f MB\n", ESP.getPsramSize() / (1024.0 * 1024.0));
+    Serial.printf("   Free PSRAM: %.2f MB\n", ESP.getFreePsram() / (1024.0 * 1024.0));
 
     // 1. Allocate main audio buffer in PSRAM
     size_t audio_buffer_bytes = ANALYSIS_SAMPLES * sizeof(float);
-    Serial.printf("Allocating audio buffer: %.2f MB...", audio_buffer_bytes / (1024.0 * 1024.0));
+    Serial.printf("Allocating audio buffer: %.2f MB in PSRAM...", audio_buffer_bytes / (1024.0 * 1024.0));
 
     g_audio_buffer_psram = (float *)ps_malloc(audio_buffer_bytes);
     if (g_audio_buffer_psram == nullptr)
     {
       Serial.println(" FAILED!");
-      return false;
+      Serial.println("Falling back to regular heap...");
+      g_audio_buffer_psram = (float *)malloc(audio_buffer_bytes);
+      if (g_audio_buffer_psram == nullptr)
+      {
+        Serial.println("Heap allocation also FAILED!");
+        return false;
+      }
+      Serial.println(" SUCCESS (using heap instead of PSRAM)!");
     }
-    Serial.println(" SUCCESS!");
+    else
+    {
+      Serial.println(" SUCCESS!");
+    }
     memset(g_audio_buffer_psram, 0, audio_buffer_bytes);
 
     // 2. Allocate model input buffer in PSRAM
     size_t model_buffer_bytes = NUM_INPUTS * sizeof(int8_t);
-    Serial.printf("Allocating model buffer: %.2f MB...", model_buffer_bytes / (1024.0 * 1024.0));
+    Serial.printf("Allocating model buffer: %.2f MB in PSRAM...", model_buffer_bytes / (1024.0 * 1024.0));
 
-    g_model_input_buffer = (int8_t *)ps_malloc(model_buffer_bytes);
+    if (psramFound())
+    {
+      g_model_input_buffer = (int8_t *)ps_malloc(model_buffer_bytes);
+    }
+    else
+    {
+      g_model_input_buffer = (int8_t *)malloc(model_buffer_bytes);
+    }
+    
     if (g_model_input_buffer == nullptr)
     {
       Serial.println(" FAILED!");
       free(g_audio_buffer_psram);
+      g_audio_buffer_psram = nullptr;
       return false;
     }
     Serial.println(" SUCCESS!");
     memset(g_model_input_buffer, 0, model_buffer_bytes);
 
-    Serial.printf("Free PSRAM after allocation: %.2f MB\n", ESP.getFreePsram() / (1024.0 * 1024.0));
+    if (psramFound())
+    {
+      Serial.printf("Free PSRAM after allocation: %.2f MB\n", ESP.getFreePsram() / (1024.0 * 1024.0));
+    }
+    Serial.printf("Free heap after allocation: %.2f KB\n", ESP.getFreeHeap() / 1024.0);
     return true;
   }
 
+  // PSRAM not found - try using regular heap as fallback
   Serial.println(" PSRAM NOT FOUND!");
-  return false;
+  Serial.println(" Attempting fallback to regular heap (may cause memory issues)...");
+  Serial.printf("   Free heap: %.2f KB\n", ESP.getFreeHeap() / 1024.0);
+  
+  // 1. Allocate main audio buffer in heap
+  size_t audio_buffer_bytes = ANALYSIS_SAMPLES * sizeof(float);
+  Serial.printf("Allocating audio buffer: %.2f MB in heap...", audio_buffer_bytes / (1024.0 * 1024.0));
+  
+  g_audio_buffer_psram = (float *)malloc(audio_buffer_bytes);
+  if (g_audio_buffer_psram == nullptr)
+  {
+    Serial.println(" FAILED!");
+    Serial.println("ERROR: Not enough heap memory for audio buffer!");
+    return false;
+  }
+  Serial.println(" SUCCESS!");
+  memset(g_audio_buffer_psram, 0, audio_buffer_bytes);
+
+  // 2. Allocate model input buffer in heap
+  size_t model_buffer_bytes = NUM_INPUTS * sizeof(int8_t);
+  Serial.printf("Allocating model buffer: %.2f MB in heap...", model_buffer_bytes / (1024.0 * 1024.0));
+  
+  g_model_input_buffer = (int8_t *)malloc(model_buffer_bytes);
+  if (g_model_input_buffer == nullptr)
+  {
+    Serial.println(" FAILED!");
+    free(g_audio_buffer_psram);
+    g_audio_buffer_psram = nullptr;
+    return false;
+  }
+  Serial.println(" SUCCESS!");
+  memset(g_model_input_buffer, 0, model_buffer_bytes);
+  
+  Serial.printf("Free heap after allocation: %.2f KB\n", ESP.getFreeHeap() / 1024.0);
+  Serial.println("WARNING: Using heap instead of PSRAM - monitor memory usage!");
+  return true;
 }
 
 bool initializeModel()
