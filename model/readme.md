@@ -1,3 +1,4 @@
- <!-- To generate the header file -->
+<!-- To generate/update the Arduino header from the latest TFLite model -->
 
-xxd -i cough_cnn_int8.tflite > model_data.h
+# Run from this `model/` folder:
+xxd -i cough_cnn1_int8.tflite > ../Arduino/main/model_data1.h

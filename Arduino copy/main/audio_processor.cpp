@@ -637,7 +637,7 @@ bool AudioProcessor::getMFCCFeatures(int8_t *mfcc_output)
 
     // Serial.println("Extracting MFCCs from circular buffer...");
 
-    // Get the most recent 9 seconds of audio into a temporary buffer
+    // Get the most recent analysis window from the circular buffer
     float *recent_audio = (float *)malloc(ANALYSIS_SAMPLES * sizeof(float));
     if (!recent_audio)
     {
@@ -645,7 +645,7 @@ bool AudioProcessor::getMFCCFeatures(int8_t *mfcc_output)
         return false;
     }
 
-    // Calculate start index (9 seconds before current write position)
+    // Calculate start index (one analysis window before current write position)
     int start_idx = _write_index - ANALYSIS_SAMPLES;
     if (start_idx < 0)
     {

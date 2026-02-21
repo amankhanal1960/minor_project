@@ -3,8 +3,10 @@ public_dataset/
 
 
 arduino/libraries/
+arduino copy/libraries/
 
 
 model/*.h5
 model/*.tflite
 model/*.h
+model/esp32_dataset/

@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <tflm_esp32.h>
 #include <eloquent_tinyml.h>
-#include "model_data1.h"
+#include "model_data_2s.h"
 #include "audio_processor.h"
 
 // ======================= HARDWARE CONFIG =======================
@@ -24,17 +24,15 @@
 #define I2S_SD_PIN  6   // Serial data - connect to INMP441 SD
 #define I2S_PORT I2S_NUM_0
 
-// Model quantization parameters from cough_cnn1_int8.tflite
-const float MODEL_INPUT_SCALE = 0.13141827285289764f;
-const int MODEL_INPUT_ZERO_POINT = -1;
+// Model quantization parameters from cough_cnn_2s_weak_int8.tflite
+const float MODEL_INPUT_SCALE = 0.058460138738155365f;
+const int MODEL_INPUT_ZERO_POINT = -4;
 const float OUTPUT_SCALE = 0.00390625f;
 const int OUTPUT_ZERO_POINT = -128;
 
 // Detection threshold
-const float COUGH_THRESHOLD = 0.3f;
-// Keep output de-bounced: report one cough event, then wait before reporting again.
-const unsigned long COUGH_REFRACTORY_MS = 25000UL;
-const float COUGH_RELEASE_FACTOR = 0.6f;
+const float COUGH_THRESHOLD = 0.35f;
+
 // Set to 1 if your model outputs [non_cough, cough]
 // Set to 0 if your model outputs [cough, non_cough]
 const int COUGH_INDEX = 1;
@@ -121,8 +119,8 @@ void loop()
 {
   static unsigned long lastInferenceTime = 0;
   static unsigned long lastStatusTime = 0;
-  // MFCC extraction takes ~8s on ESP32-S3 for a 9s window.
-  // Keep only a short post-inference capture gap to improve responsiveness.
+  // MFCC extraction takes ~2s on ESP32-S3 for the 2s model window.
+  // Keep a short post-inference gap to improve responsiveness.
   const unsigned long INFERENCE_INTERVAL_MS = 1000UL;
   const unsigned long STATUS_INTERVAL_MS = 5000;
 
@@ -298,7 +296,7 @@ bool initializeModel()
 
   // Load the model
   Serial.println("Loading TensorFlow Lite model...");
-  auto status = tf.begin(cough_cnn1_int8_tflite);
+  auto status = tf.begin(cough_cnn_2s_weak_int8_tflite);
 
   if (!status.isOk())
   {
@@ -308,7 +306,7 @@ bool initializeModel()
   }
 
   Serial.println(" Model loaded successfully");
-  Serial.printf("  Model size: %d bytes\n", cough_cnn1_int8_tflite_len);
+  Serial.printf("  Model size: %d bytes\n", cough_cnn_2s_weak_int8_tflite_len);
   Serial.printf("  Tensor arena: %d bytes\n", TENSOR_ARENA_SIZE);
 
   // Run a dummy inference to warm up
@@ -350,37 +348,13 @@ void runInference()
 {
   // Timestamp (seconds since boot) for this inference
   unsigned long t_seconds = millis() / 1000;
-  unsigned long window_end_seconds = t_seconds;
-  unsigned long window_start_seconds = (window_end_seconds > ANALYSIS_SECONDS)
-                                         ? (window_end_seconds - ANALYSIS_SECONDS)
-                                         : 0;
 
-  // 1. Extract MFCC features directly into PSRAM buffer
-  unsigned long featureStart = micros();
+  // 1. Extract MFCC features into model input buffer
   if (!audioProcessor.getMFCCFeatures(g_model_input_buffer))
   {
     Serial.printf("[%lus] Failed to extract MFCC features.\n", t_seconds);
     return;
   }
-  unsigned long featureTime = micros() - featureStart;
-
-  // Debug telemetry to verify that mic signal and MFCC input are changing
-  float rms = 0.0f, peak = 0.0f, dc = 0.0f;
-  audioProcessor.getAudioStats(rms, peak, dc);
-
-  int q_min = 127;
-  int q_max = -128;
-  long q_abs_sum = 0;
-  for (int i = 0; i < NUM_INPUTS; i++)
-  {
-    int q = (int)g_model_input_buffer[i];
-    if (q < q_min)
-      q_min = q;
-    if (q > q_max)
-      q_max = q;
-    q_abs_sum += abs(q - MODEL_INPUT_ZERO_POINT);
-  }
-  float q_abs_mean = (float)q_abs_sum / (float)NUM_INPUTS;
 
   // 2. Run inference
   unsigned long startTime = micros();
@@ -393,51 +367,116 @@ void runInference()
     return;
   }
 
-  // 3. Dequantize and process results
+  // 3. Dequantize outputs
   int q0 = (int)round(tf.output(0));
   int q1 = (int)round(tf.output(1));
 
-  // Dequantize
   float p0 = (q0 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
   float p1 = (q1 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
   float p_cough = (COUGH_INDEX == 0) ? p0 : p1;
   float p_non_cough = (COUGH_INDEX == 0) ? p1 : p0;
 
-  // 4. Display results with timestamp and inference time
-  Serial.printf("[%lus] Window:[%lu-%lu]s Feature:%lu us Inference:%lu us Class0:%.4f Class1:%.4f Probabilities:[Cough:%.4f Non-Cough:%.4f]\n",
-                t_seconds, window_start_seconds, window_end_seconds,
-                featureTime, inferenceTime, p0, p1, p_cough, p_non_cough);
-  Serial.printf("      Audio[RMS=%.6f Peak=%.6f DC=%.6f] MFCC[qmin=%d qmax=%d mean|q-zp|=%.2f]\n",
-                rms, peak, dc, q_min, q_max, q_abs_mean);
+  // 4. Print inference result and confidence
+  Serial.printf("[%lus] Inference time: %lu us, Cough: %.4f, Non-Cough: %.4f\n",
+                t_seconds, inferenceTime, p_cough, p_non_cough);
 
-  if (peak < 0.003f || q_abs_mean < 0.75f)
-  {
-    Serial.println("      WARNING: Mic/features look too flat. Check INMP441 L/R pin, wiring, and I2S format.");
-  }
-
-  // 5. Detection logic with hysteresis + refractory period
-  static bool cough_latched = false;
-  static unsigned long last_cough_event_ms = 0;
-
-  const float release_threshold = COUGH_THRESHOLD * COUGH_RELEASE_FACTOR;
-  const unsigned long now_ms = millis();
-  const bool cooldown_passed = (last_cough_event_ms == 0) ||
-                               (now_ms - last_cough_event_ms >= COUGH_REFRACTORY_MS);
-
+  // 5. Simple threshold-based detection (no refractory/confirmation)
   if (p_cough >= COUGH_THRESHOLD)
   {
-    if (!cough_latched && cooldown_passed)
-    {
-      Serial.println("  ||||||||||||||||||||| COUGH DETECTED! |||||||||||||||||||||");
-      last_cough_event_ms = now_ms;
+    Serial.println("  🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨 COUGH DETECTED! 🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨");
 
-      // Add your actions here
-    }
-
-    cough_latched = true;
-  }
-  else if (p_cough <= release_threshold)
-  {
-    cough_latched = false;
+    // Add your actions here
   }
 }
+
+
+// #include <Arduino.h>
+// #include <driver/i2s.h>
+
+// #define I2S_BCK_PIN 5
+// #define I2S_WS_PIN  4
+// #define I2S_SD_PIN  6
+// #define I2S_PORT I2S_NUM_0
+
+// static const uint32_t SAMPLE_RATE = 16000;
+// static const uint32_t CLIP_SECONDS = 2;           // change if needed
+// static const uint32_t CLIP_SAMPLES = SAMPLE_RATE * CLIP_SECONDS;
+// static const uint32_t READ_CHUNK = 512;
+
+// struct __attribute__((packed)) ClipHeader {
+//   char magic[4];          // "AUD0"
+//   uint32_t sample_rate;   // 16000
+//   uint32_t sample_count;  // 32000 for 2s
+//   uint8_t label;          // 'C' or 'N'
+// };
+
+// int32_t in32[READ_CHUNK];
+// int16_t out16[READ_CHUNK];
+
+// void setupI2S() {
+//   i2s_config_t cfg = {
+//     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+//     .sample_rate = SAMPLE_RATE,
+//     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+//     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+//     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+//     .intr_alloc_flags = 0,
+//     .dma_buf_count = 8,
+//     .dma_buf_len = 64,
+//     .use_apll = false,
+//     .tx_desc_auto_clear = false,
+//     .fixed_mclk = 0
+//   };
+
+//   i2s_pin_config_t pins = {
+//     .bck_io_num = I2S_BCK_PIN,
+//     .ws_io_num = I2S_WS_PIN,
+//     .data_out_num = I2S_PIN_NO_CHANGE,
+//     .data_in_num = I2S_SD_PIN
+//   };
+
+//   i2s_driver_install(I2S_PORT, &cfg, 0, nullptr);
+//   i2s_set_pin(I2S_PORT, &pins);
+//   i2s_zero_dma_buffer(I2S_PORT);
+//   i2s_start(I2S_PORT);
+// }
+
+// // right-justified 24-bit -> int16
+// inline int16_t i2s32ToInt16(int32_t s) {
+//   int32_t s24 = s & 0x00FFFFFF;
+//   if (s24 & 0x00800000) s24 |= 0xFF000000;
+//   return (int16_t)(s24 >> 8);
+// }
+
+// void streamClip(uint8_t label) {
+//   ClipHeader h = {{'A','U','D','0'}, SAMPLE_RATE, CLIP_SAMPLES, label};
+//   Serial.write((uint8_t*)&h, sizeof(h));
+
+//   uint32_t sent = 0;
+//   while (sent < CLIP_SAMPLES) {
+//     size_t bytesRead = 0;
+//     i2s_read(I2S_PORT, in32, sizeof(in32), &bytesRead, portMAX_DELAY);
+//     int got = (int)(bytesRead / sizeof(int32_t));
+//     int take = min((uint32_t)got, CLIP_SAMPLES - sent);
+
+//     for (int i = 0; i < take; i++) out16[i] = i2s32ToInt16(in32[i]);
+//     Serial.write((uint8_t*)out16, take * sizeof(int16_t));
+//     sent += take;
+//   }
+// }
+
+// void setup() {
+//   Serial.begin(921600); // keep high for binary stream
+//   setupI2S();
+// }
+
+// void loop() {
+//   if (!Serial.available()) return;
+//   uint8_t cmd = (uint8_t)Serial.read();
+
+//   if (cmd == 'C' || cmd == 'N') {
+//     streamClip(cmd); // binary payload
+//   }
+// }
+
+

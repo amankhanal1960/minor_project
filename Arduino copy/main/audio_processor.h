@@ -13,16 +13,16 @@
 #define NUM_MFCCS 40
 // Match librosa.feature.mfcc default mel bank size used in training.
 #define NUM_MEL_FILTERS 128
-#define ANALYSIS_SECONDS 9
-#define BUFFER_SECONDS 10
+#define ANALYSIS_SECONDS 2
+#define BUFFER_SECONDS 4
 #define BUFFER_SAMPLES (SAMPLE_RATE * BUFFER_SECONDS)
 
-#define NUM_FRAMES 280
+#define NUM_FRAMES 61
 
 #define ANALYSIS_SAMPLES (N_FFT + (NUM_FRAMES - 1) * HOP_LENGTH) 
 #define ANALYSIS_SECONDS_FLOAT (ANALYSIS_SAMPLES / (float)SAMPLE_RATE)  
 
-#define NUM_INPUTS (NUM_FRAMES * NUM_MFCCS) // 280 * 40
+#define NUM_INPUTS (NUM_FRAMES * NUM_MFCCS) // 61 * 40
 
 // Model quantization parameters (from python model)
 
@@ -39,8 +39,8 @@ public:
     // Initializes FFT, window, Mel filterbank, DCT matrix, and working buffers.
     bool begin();
 
-    // Extract the mfcc from 9 second audio (144000 samples)
-    // Return float MFCCs(40 x 280)
+    // Extract MFCC from the current analysis window (~2 seconds)
+    // Return float MFCCs(NUM_MFCCS x NUM_FRAMES)
     bool extractMFCC(const float *audio, float *mfcc_output);
 
     // Incremental processing (optimization for sliding window)
@@ -82,7 +82,7 @@ private:
     // MFCC processing for a single frame
     void processFrame(const float *frame, float *mfcc_output);
 
-    // Standardization (per_coefficient z-score across 280 frames)
+    // Standardization (per-coefficient z-score across NUM_FRAMES)
     void standardizeMFCCs(float *mfccs);
 
     // Helper: Slaney Mel conversion (librosa default, htk=False).
@@ -119,8 +119,8 @@ private:
 class AudioProcessor
 {
 public:
-    AudioProcessor(int bckPin, int wsPin, int sdPin,float input_scale = 0.13141827285289764f,
-                   int input_zero_point = -1, i2s_port_t port = I2S_NUM_0);
+    AudioProcessor(int bckPin, int wsPin, int sdPin,float input_scale = 0.058460138738155365f,
+                   int input_zero_point = -4, i2s_port_t port = I2S_NUM_0);
     ~AudioProcessor();
     // Initialize I2S and audio processing
     bool begin(int sampleRate = 16000);
