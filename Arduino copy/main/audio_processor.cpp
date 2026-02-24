@@ -432,7 +432,8 @@ AudioProcessor::AudioProcessor(int bckPin, int wsPin, int sdPin,
       _frame_position(0), _hop_counter(0),
       _input_scale(input_scale), _input_zero_point(input_zero_point),
       _i2s_format_locked(false), _i2s_left_justified_24bit(true),
-      _i2s_probe_count(0), _i2s_probe_lsb_zero_count(0)
+      _i2s_probe_count(0), _i2s_probe_lsb_zero_count(0),
+      _bandpass_enabled(false), _bandpass_low_hz(150.0f), _bandpass_high_hz(3500.0f)
 {
     _pinConfig.bck_io_num = bckPin;
     _pinConfig.ws_io_num = wsPin;
@@ -440,6 +441,8 @@ AudioProcessor::AudioProcessor(int bckPin, int wsPin, int sdPin,
     _pinConfig.data_in_num = sdPin;
 
     memset(_frame_buffer, 0, sizeof(_frame_buffer));
+    memset(&_bp_highpass, 0, sizeof(_bp_highpass));
+    memset(&_bp_lowpass, 0, sizeof(_bp_lowpass));
 }
 
 AudioProcessor::~AudioProcessor()
@@ -455,6 +458,16 @@ bool AudioProcessor::begin(int sampleRate)
     Serial.printf("Sample rate: %d Hz\n", _sampleRate);
     Serial.printf("Analysis window: %d seconds\n", ANALYSIS_SECONDS);
     Serial.printf("Buffer size: %d samples\n", BUFFER_SAMPLES);
+
+    if (_bandpass_enabled)
+    {
+        initBandpassFilter();
+        Serial.printf("Band-pass filter: %.0f-%.0f Hz\n", _bandpass_low_hz, _bandpass_high_hz);
+    }
+    else
+    {
+        Serial.println("Band-pass filter: disabled");
+    }
 
     // Initialize MFCC extractor
     if (!_mfcc_extractor.begin())
@@ -472,7 +485,7 @@ bool AudioProcessor::begin(int sampleRate)
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = 0,
         .dma_buf_count = 8,
-        .dma_buf_len = 64,
+        .dma_buf_len = 512,
         .use_apll = false,
         .tx_desc_auto_clear = false,
         .fixed_mclk = 0};
@@ -510,17 +523,108 @@ bool AudioProcessor::begin(int sampleRate)
     return true;
 }
 
+
+void AudioProcessor::initBandpassFilter()
+{
+    // 4th-order band-pass built as cascaded 2nd-order high-pass and low-pass.
+    const float q = 0.70710678f;
+    configureHighpass(_bp_highpass, _bandpass_low_hz, q);
+    configureLowpass(_bp_lowpass, _bandpass_high_hz, q);
+}
+
+void AudioProcessor::configureHighpass(BiquadSection &section, float cutoff_hz, float q)
+{
+    const float w0 = 2.0f * M_PI * cutoff_hz / (float)_sampleRate;
+    const float c = cosf(w0);
+    const float s = sinf(w0);
+    const float alpha = s / (2.0f * q);
+
+    const float b0 = (1.0f + c) * 0.5f;
+    const float b1 = -(1.0f + c);
+    const float b2 = (1.0f + c) * 0.5f;
+    const float a0 = 1.0f + alpha;
+    const float a1 = -2.0f * c;
+    const float a2 = 1.0f - alpha;
+
+    section.b0 = b0 / a0;
+    section.b1 = b1 / a0;
+    section.b2 = b2 / a0;
+    section.a1 = a1 / a0;
+    section.a2 = a2 / a0;
+    section.z1 = 0.0f;
+    section.z2 = 0.0f;
+}
+
+void AudioProcessor::configureLowpass(BiquadSection &section, float cutoff_hz, float q)
+{
+    const float w0 = 2.0f * M_PI * cutoff_hz / (float)_sampleRate;
+    const float c = cosf(w0);
+    const float s = sinf(w0);
+    const float alpha = s / (2.0f * q);
+
+    const float b0 = (1.0f - c) * 0.5f;
+    const float b1 = (1.0f - c);
+    const float b2 = (1.0f - c) * 0.5f;
+    const float a0 = 1.0f + alpha;
+    const float a1 = -2.0f * c;
+    const float a2 = 1.0f - alpha;
+
+    section.b0 = b0 / a0;
+    section.b1 = b1 / a0;
+    section.b2 = b2 / a0;
+    section.a1 = a1 / a0;
+    section.a2 = a2 / a0;
+    section.z1 = 0.0f;
+    section.z2 = 0.0f;
+}
+
+float AudioProcessor::processBiquad(BiquadSection &section, float x)
+{
+    // Direct Form II Transposed
+    const float y = section.b0 * x + section.z1;
+    section.z1 = section.b1 * x - section.a1 * y + section.z2;
+    section.z2 = section.b2 * x - section.a2 * y;
+    return y;
+}
+
+float AudioProcessor::applyBandpass(float sample)
+{
+    if (!_bandpass_enabled)
+    {
+        return sample;
+    }
+
+    float y = processBiquad(_bp_highpass, sample);
+    y = processBiquad(_bp_lowpass, y);
+    return y;
+}
+
 float AudioProcessor::convertI2SToFloat(int32_t i2s_sample)
 {
-    // Probe early samples to detect how the I2S driver packs 24-bit mic data.
-    // Some boards deliver 24-bit data left-justified (LSB mostly zero),
-    // others right-justified in the low 24 bits.
+    // Auto-detect if incoming 24-bit data is left-justified or right-justified in 32-bit word.
+    // Important: only probe on non-trivial signal levels; probing on silence/noise can lock wrong mode.
     if (!_i2s_format_locked)
     {
-        _i2s_probe_count++;
-        if ((i2s_sample & 0xFF) == 0)
+        int32_t left_probe = i2s_sample >> 8;
+
+        int32_t right_probe = i2s_sample & 0x00FFFFFF;
+        if (right_probe & 0x00800000)
         {
-            _i2s_probe_lsb_zero_count++;
+            right_probe |= 0xFF000000;
+        }
+
+        float left_abs = fabsf((float)left_probe / 8388608.0f);
+        float right_abs = fabsf((float)right_probe / 8388608.0f);
+        float activity = (left_abs > right_abs) ? left_abs : right_abs;
+
+        // Gate probing until we see meaningful audio activity.
+        if (activity >= 0.01f)
+        {
+            _i2s_probe_count++;
+            if ((i2s_sample & 0xFF) == 0)
+            {
+                _i2s_probe_lsb_zero_count++;
+            }
         }
 
         if (_i2s_probe_count >= 2048)
@@ -548,6 +652,12 @@ float AudioProcessor::convertI2SToFloat(int32_t i2s_sample)
             audio_24bit |= 0xFF000000;
         }
     }
+
+    // Match collector sketch behavior: clamp decoded 24-bit range before scaling.
+    if (audio_24bit > 8388607)
+        audio_24bit = 8388607;
+    if (audio_24bit < -8388608)
+        audio_24bit = -8388608;
 
     // Convert to float in range [-1.0, 1.0]
     // 24-bit signed range: -8388608 to 8388607
@@ -610,6 +720,14 @@ int AudioProcessor::read(int32_t *buffer, int bufferLength)
     {
         float sample = convertI2SToFloat(buffer[i]);
 
+        // Avoid filling inference buffer with pre-lock garbage during I2S format probing.
+        if (!_i2s_format_locked)
+        {
+            continue;
+        }
+
+        sample = applyBandpass(sample);
+
         // Store in circular buffer
         _audio_buffer[_write_index] = sample;
         _write_index = (_write_index + 1) % BUFFER_SAMPLES;
@@ -637,7 +755,7 @@ bool AudioProcessor::getMFCCFeatures(int8_t *mfcc_output)
 
     // Serial.println("Extracting MFCCs from circular buffer...");
 
-    // Get the most recent analysis window from the circular buffer
+    // Get the most recent analysis window into a temporary buffer
     float *recent_audio = (float *)malloc(ANALYSIS_SAMPLES * sizeof(float));
     if (!recent_audio)
     {
@@ -724,6 +842,14 @@ void AudioProcessor::processIncremental(const int32_t *i2s_samples, int count)
     {
         // Convert to float
         float sample = convertI2SToFloat(i2s_samples[i]);
+
+        // Avoid filling inference buffer with pre-lock garbage during I2S format probing.
+        if (!_i2s_format_locked)
+        {
+            continue;
+        }
+
+        sample = applyBandpass(sample);
 
         // Store in circular buffer
         _audio_buffer[_write_index] = sample;

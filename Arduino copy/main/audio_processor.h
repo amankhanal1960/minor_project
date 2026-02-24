@@ -1,6 +1,7 @@
 #ifndef AUDIO_PROCESSOR_H
 #define AUDIO_PROCESSOR_H
 
+#include <Arduino.h>
 #include <driver/i2s.h>
 #include <math.h>
 #include <stdint.h>
@@ -13,16 +14,16 @@
 #define NUM_MFCCS 40
 // Match librosa.feature.mfcc default mel bank size used in training.
 #define NUM_MEL_FILTERS 128
-#define ANALYSIS_SECONDS 2
-#define BUFFER_SECONDS 4
+#define ANALYSIS_SECONDS 5
+#define BUFFER_SECONDS 8
 #define BUFFER_SAMPLES (SAMPLE_RATE * BUFFER_SECONDS)
 
-#define NUM_FRAMES 61
+#define NUM_FRAMES 155
 
 #define ANALYSIS_SAMPLES (N_FFT + (NUM_FRAMES - 1) * HOP_LENGTH) 
 #define ANALYSIS_SECONDS_FLOAT (ANALYSIS_SAMPLES / (float)SAMPLE_RATE)  
 
-#define NUM_INPUTS (NUM_FRAMES * NUM_MFCCS) // 61 * 40
+#define NUM_INPUTS (NUM_FRAMES * NUM_MFCCS) // 155 * 40
 
 // Model quantization parameters (from python model)
 
@@ -39,7 +40,7 @@ public:
     // Initializes FFT, window, Mel filterbank, DCT matrix, and working buffers.
     bool begin();
 
-    // Extract MFCC from the current analysis window (~2 seconds)
+    // Extract MFCC from the current analysis window (~5 seconds)
     // Return float MFCCs(NUM_MFCCS x NUM_FRAMES)
     bool extractMFCC(const float *audio, float *mfcc_output);
 
@@ -82,7 +83,7 @@ private:
     // MFCC processing for a single frame
     void processFrame(const float *frame, float *mfcc_output);
 
-    // Standardization (per-coefficient z-score across NUM_FRAMES)
+    // Standardization (per-coefficient z-score across NUM_FRAMES frames)
     void standardizeMFCCs(float *mfccs);
 
     // Helper: Slaney Mel conversion (librosa default, htk=False).
@@ -119,8 +120,8 @@ private:
 class AudioProcessor
 {
 public:
-    AudioProcessor(int bckPin, int wsPin, int sdPin,float input_scale = 0.058460138738155365f,
-                   int input_zero_point = -4, i2s_port_t port = I2S_NUM_0);
+    AudioProcessor(int bckPin, int wsPin, int sdPin,float input_scale = 0.09420423954725266f,
+                   int input_zero_point = -1, i2s_port_t port = I2S_NUM_0);
     ~AudioProcessor();
     // Initialize I2S and audio processing
     bool begin(int sampleRate = 16000);
@@ -144,6 +145,7 @@ public:
     // continuous incremental processing
     void processIncremental(const int32_t *i2s_samples, int count);
     bool getCurrentMFCC(int8_t *mfcc_output);
+
 
     void setAudioBuffer(float* external_buffer) {
         _audio_buffer = external_buffer;
@@ -177,8 +179,29 @@ private:
     uint32_t _i2s_probe_count;
     uint32_t _i2s_probe_lsb_zero_count;
 
+    // 2nd-order IIR band-pass (high-pass + low-pass) to suppress rumble and hiss.
+    struct BiquadSection
+    {
+        float b0, b1, b2;
+        float a1, a2;
+        float z1, z2;
+    };
+
+    BiquadSection _bp_highpass;
+    BiquadSection _bp_lowpass;
+    bool _bandpass_enabled;
+    float _bandpass_low_hz;
+    float _bandpass_high_hz;
+
     // Convert I2S 24-bit to float [-1, 1]
     float convertI2SToFloat(int32_t i2s_sample);
+
+    // Band-pass filter helpers
+    void initBandpassFilter();
+    void configureHighpass(BiquadSection &section, float cutoff_hz, float q);
+    void configureLowpass(BiquadSection &section, float cutoff_hz, float q);
+    float processBiquad(BiquadSection &section, float x);
+    float applyBandpass(float sample);
 
     // convert float to int8 using model quantization
     void quantizeMFCC(const float *mfcc_float, int8_t *mfcc_int8);
