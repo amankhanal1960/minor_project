@@ -56,7 +56,7 @@ void runInference();
 // ======================= SETUP =======================
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(460800);
 
   // CRITICAL for ESP32-S3 USB Serial
   while (!Serial)
@@ -416,7 +416,7 @@ void runInference()
   // 5. Detection logic (single threshold)
   if (p_cough >= COUGH_THRESHOLD)
   {
-    Serial.println("  ||||||||||||||||||||| COUGH DETECTED! |||||||||||||||||||||");
+    Serial.println("  🚨🚨🚨🚨🚨🚨🚨 COUGH DETECTED! 🚨🚨🚨🚨🚨🚨🚨");
 
     // Add your actions here
   }
