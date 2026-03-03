@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <tflm_esp32.h>
 #include <eloquent_tinyml.h>
-#include "model_data1.h"
+#include "model_data_5s.h"
 #include "audio_processor.h"
 
 // ======================= HARDWARE CONFIG =======================
@@ -10,7 +10,7 @@
 // Check your board's pinout diagram to find which physical pins correspond
 // to these GPIO numbers, then wire INMP441 accordingly:
 //   INMP441 SCK -> GPIO I2S_BCK_PIN
-//   INMP441 WS  -> GPIO I2S_WS_PIN  
+//   INMP441 WS  -> GPIO I2S_WS_PIN
 //   INMP441 SD  -> GPIO I2S_SD_PIN
 //   INMP441 L/R -> GND
 //   INMP441 VCC -> 3.3V
@@ -19,26 +19,23 @@
 // Common safe GPIOs for I2S on ESP32-S3 (avoid GPIO 0, 3, 45, 46 which are strapping pins):
 // GPIO 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, etc.
 // Update these to match your actual wiring:
-#define I2S_BCK_PIN 5   // Bit clock - connect to INMP441 SCK
-#define I2S_WS_PIN  4   // Word select - connect to INMP441 WS
-#define I2S_SD_PIN  6   // Serial data - connect to INMP441 SD
+#define I2S_BCK_PIN 5 // Bit clock - connect to INMP441 SCK
+#define I2S_WS_PIN 4  // Word select - connect to INMP441 WS
+#define I2S_SD_PIN 6  // Serial data - connect to INMP441 SD
 #define I2S_PORT I2S_NUM_0
 
-// Model quantization parameters from cough_cnn1_int8.tflite
-const float MODEL_INPUT_SCALE = 0.13141827285289764f;
+// Model quantization parameters from cough_cnn_5s_base_int8.tflite
+const float MODEL_INPUT_SCALE = 0.09420423954725266f;
 const int MODEL_INPUT_ZERO_POINT = -1;
 const float OUTPUT_SCALE = 0.00390625f;
 const int OUTPUT_ZERO_POINT = -128;
 
 // Detection threshold
-const float COUGH_THRESHOLD = 0.3f;
-// Keep output de-bounced: report one cough event, then wait before reporting again.
-const unsigned long COUGH_REFRACTORY_MS = 25000UL;
-const float COUGH_RELEASE_FACTOR = 0.6f;
+const float COUGH_THRESHOLD = 0.60f;
 // Set to 1 if your model outputs [non_cough, cough]
 // Set to 0 if your model outputs [cough, non_cough]
 const int COUGH_INDEX = 1;
-#define TENSOR_ARENA_SIZE (64 * 1024)
+#define TENSOR_ARENA_SIZE (160 * 1024)
 
 // ======================= GLOBAL OBJECTS & BUFFERS =======================
 Eloquent::TF::Sequential<30, TENSOR_ARENA_SIZE> tf;
@@ -59,7 +56,7 @@ void runInference();
 // ======================= SETUP =======================
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(460800);
 
   // CRITICAL for ESP32-S3 USB Serial
   while (!Serial)
@@ -121,7 +118,7 @@ void loop()
 {
   static unsigned long lastInferenceTime = 0;
   static unsigned long lastStatusTime = 0;
-  // MFCC extraction takes ~8s on ESP32-S3 for a 9s window.
+  // MFCC extraction takes longer for a 5s window on ESP32-S3.
   // Keep only a short post-inference capture gap to improve responsiveness.
   const unsigned long INFERENCE_INTERVAL_MS = 1000UL;
   const unsigned long STATUS_INTERVAL_MS = 5000;
@@ -134,6 +131,7 @@ void loop()
 
   int samplesRead = audioProcessor.read(i2sBuffer, I2S_READ_BUFFER_SIZE);
   (void)samplesRead;
+
 
   // 2. Run inference at regular intervals
   if (currentTime - lastInferenceTime >= INFERENCE_INTERVAL_MS)
@@ -174,7 +172,7 @@ void loop()
 bool initializePSRAM()
 {
   Serial.println("--- PSRAM Initialization ---");
-  
+
   // Diagnostic: Check chip info
   Serial.printf("Chip model: %s\n", ESP.getChipModel());
   Serial.printf("Chip revision: %d\n", ESP.getChipRevision());
@@ -221,7 +219,7 @@ bool initializePSRAM()
     {
       g_model_input_buffer = (int8_t *)malloc(model_buffer_bytes);
     }
-    
+
     if (g_model_input_buffer == nullptr)
     {
       Serial.println(" FAILED!");
@@ -244,11 +242,11 @@ bool initializePSRAM()
   Serial.println(" PSRAM NOT FOUND!");
   Serial.println(" Attempting fallback to regular heap (may cause memory issues)...");
   Serial.printf("   Free heap: %.2f KB\n", ESP.getFreeHeap() / 1024.0);
-  
+
   // 1. Allocate main audio buffer in heap
   size_t audio_buffer_bytes = BUFFER_SAMPLES * sizeof(float);
   Serial.printf("Allocating audio buffer: %.2f MB in heap...", audio_buffer_bytes / (1024.0 * 1024.0));
-  
+
   g_audio_buffer_psram = (float *)malloc(audio_buffer_bytes);
   if (g_audio_buffer_psram == nullptr)
   {
@@ -262,7 +260,7 @@ bool initializePSRAM()
   // 2. Allocate model input buffer in heap
   size_t model_buffer_bytes = NUM_INPUTS * sizeof(int8_t);
   Serial.printf("Allocating model buffer: %.2f MB in heap...", model_buffer_bytes / (1024.0 * 1024.0));
-  
+
   g_model_input_buffer = (int8_t *)malloc(model_buffer_bytes);
   if (g_model_input_buffer == nullptr)
   {
@@ -273,7 +271,7 @@ bool initializePSRAM()
   }
   Serial.println(" SUCCESS!");
   memset(g_model_input_buffer, 0, model_buffer_bytes);
-  
+
   Serial.printf("Free heap after allocation: %.2f KB\n", ESP.getFreeHeap() / 1024.0);
   Serial.println("WARNING: Using heap instead of PSRAM - monitor memory usage!");
   return true;
@@ -298,7 +296,7 @@ bool initializeModel()
 
   // Load the model
   Serial.println("Loading TensorFlow Lite model...");
-  auto status = tf.begin(cough_cnn1_int8_tflite);
+  auto status = tf.begin(cough_cnn_5s_base_int8_tflite);
 
   if (!status.isOk())
   {
@@ -308,7 +306,7 @@ bool initializeModel()
   }
 
   Serial.println(" Model loaded successfully");
-  Serial.printf("  Model size: %d bytes\n", cough_cnn1_int8_tflite_len);
+  Serial.printf("  Model size: %d bytes\n", cough_cnn_5s_base_int8_tflite_len);
   Serial.printf("  Tensor arena: %d bytes\n", TENSOR_ARENA_SIZE);
 
   // Run a dummy inference to warm up
@@ -352,8 +350,8 @@ void runInference()
   unsigned long t_seconds = millis() / 1000;
   unsigned long window_end_seconds = t_seconds;
   unsigned long window_start_seconds = (window_end_seconds > ANALYSIS_SECONDS)
-                                         ? (window_end_seconds - ANALYSIS_SECONDS)
-                                         : 0;
+                                           ? (window_end_seconds - ANALYSIS_SECONDS)
+                                           : 0;
 
   // 1. Extract MFCC features directly into PSRAM buffer
   unsigned long featureStart = micros();
@@ -415,29 +413,11 @@ void runInference()
     Serial.println("      WARNING: Mic/features look too flat. Check INMP441 L/R pin, wiring, and I2S format.");
   }
 
-  // 5. Detection logic with hysteresis + refractory period
-  static bool cough_latched = false;
-  static unsigned long last_cough_event_ms = 0;
-
-  const float release_threshold = COUGH_THRESHOLD * COUGH_RELEASE_FACTOR;
-  const unsigned long now_ms = millis();
-  const bool cooldown_passed = (last_cough_event_ms == 0) ||
-                               (now_ms - last_cough_event_ms >= COUGH_REFRACTORY_MS);
-
+  // 5. Detection logic (single threshold)
   if (p_cough >= COUGH_THRESHOLD)
   {
-    if (!cough_latched && cooldown_passed)
-    {
-      Serial.println("  ||||||||||||||||||||| COUGH DETECTED! |||||||||||||||||||||");
-      last_cough_event_ms = now_ms;
+    Serial.println("  🚨🚨🚨🚨🚨🚨🚨 COUGH DETECTED! 🚨🚨🚨🚨🚨🚨🚨");
 
-      // Add your actions here
-    }
-
-    cough_latched = true;
-  }
-  else if (p_cough <= release_threshold)
-  {
-    cough_latched = false;
+    // Add your actions here
   }
 }
