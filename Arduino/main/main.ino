@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include <tflm_esp32.h>
 #include <eloquent_tinyml.h>
 #include "model_data_5s.h"
@@ -24,6 +25,23 @@
 #define I2S_SD_PIN 6  // Serial data - connect to INMP441 SD
 #define I2S_PORT I2S_NUM_0
 
+// ======================= NEW: MPU6050 MOTION GATE CONFIG =======================
+// NEW: I2C pins for MPU6050. Change to match your wiring.
+// NEW: Keep these different from I2S pins used by the microphone.
+#define IMU_I2C_SDA_PIN 8
+#define IMU_I2C_SCL_PIN 9
+#define IMU_I2C_FREQ_HZ 400000UL
+#define MPU6050_ADDR 0x68
+
+// NEW: Motion sampling and fusion thresholds.
+#define MOTION_SAMPLE_RATE_HZ 100
+#define MOTION_RING_SECONDS 6
+#define MOTION_RING_SIZE (MOTION_SAMPLE_RATE_HZ * MOTION_RING_SECONDS)
+#define MOTION_FUSION_WINDOW_MS 1200UL
+#define ACCEL_MOTION_THRESHOLD_G 0.12f
+#define MOTION_CALIB_SAMPLES 200
+// ======================= END NEW MOTION GATE CONFIG =======================
+
 // Model quantization parameters from cough_cnn_5s_base_int8.tflite
 const float MODEL_INPUT_SCALE = 0.09420423954725266f;
 const int MODEL_INPUT_ZERO_POINT = -1;
@@ -46,12 +64,136 @@ float *g_audio_buffer_psram = nullptr;
 // Model input buffer allocated in PSRAM
 int8_t *g_model_input_buffer = nullptr;
 
+// ======================= NEW: MOTION PIPELINE STATE =======================
+// NEW: Per-sample motion value in g (dynamic acceleration magnitude) with timestamp.
+struct MotionSample
+{
+  float dyn_acc_g;
+  uint32_t t_ms;
+};
+
+MotionSample g_motion_ring[MOTION_RING_SIZE];
+int g_motion_write_idx = 0;
+int g_motion_count = 0;
+uint32_t g_next_motion_sample_us = 0;
+bool g_motion_sensor_ready = false;
+
+// NEW: Runtime accelerometer bias estimated during startup calibration.
+float g_acc_bias_x = 0.0f;
+float g_acc_bias_y = 0.0f;
+float g_acc_bias_z = 0.0f;
+// ======================= END NEW MOTION PIPELINE STATE =======================
+
 // ======================= FUNCTION DECLARATIONS =======================
 bool initializePSRAM();
 bool initializeModel();
 bool initializeAudioProcessor();
-void runInference();
-// void printSystemStatus();
+// ======================= NEW: MOTION PIPELINE DECLARATIONS =======================
+bool initializeMotionPipeline();
+void updateMotionPipeline();
+bool getMotionWindowMetric(uint32_t window_ms, float &peak_dyn_acc_g, float &mean_dyn_acc_g);
+bool mpuWriteReg(uint8_t reg, uint8_t value);
+bool mpuReadRegs(uint8_t start_reg, uint8_t *buffer, size_t len);
+bool readAccelInG(float &ax_g, float &ay_g, float &az_g);
+// ======================= END NEW MOTION PIPELINE DECLARATIONS =======================
+void runInference()
+{
+  // Timestamp (seconds since boot) for this inference
+  unsigned long t_seconds = millis() / 1000;
+  unsigned long window_end_seconds = t_seconds;
+  unsigned long window_start_seconds = (window_end_seconds > ANALYSIS_SECONDS)
+                                           ? (window_end_seconds - ANALYSIS_SECONDS)
+                                           : 0;
+
+  // 1. Extract MFCC features directly into PSRAM buffer
+  unsigned long featureStart = micros();
+  if (!audioProcessor.getMFCCFeatures(g_model_input_buffer))
+  {
+    Serial.printf("[%lus] Failed to extract MFCC features.\n", t_seconds);
+    return;
+  }
+  unsigned long featureTime = micros() - featureStart;
+
+  // Debug telemetry to verify that mic signal and MFCC input are changing
+  float rms = 0.0f, peak = 0.0f, dc = 0.0f;
+  audioProcessor.getAudioStats(rms, peak, dc);
+
+  int q_min = 127;
+  int q_max = -128;
+  long q_abs_sum = 0;
+  for (int i = 0; i < NUM_INPUTS; i++)
+  {
+    int q = (int)g_model_input_buffer[i];
+    if (q < q_min)
+      q_min = q;
+    if (q > q_max)
+      q_max = q;
+    q_abs_sum += abs(q - MODEL_INPUT_ZERO_POINT);
+  }
+  float q_abs_mean = (float)q_abs_sum / (float)NUM_INPUTS;
+
+  // 2. Run inference
+  unsigned long startTime = micros();
+  auto predictStatus = tf.predict(g_model_input_buffer);
+  unsigned long inferenceTime = micros() - startTime;
+
+  if (!predictStatus.isOk())
+  {
+    Serial.printf("[%lus] Inference failed: %s\n", t_seconds, predictStatus.toString().c_str());
+    return;
+  }
+
+  // 3. Dequantize and process results
+  int q0 = (int)round(tf.output(0));
+  int q1 = (int)round(tf.output(1));
+
+  // Dequantize
+  float p0 = (q0 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
+  float p1 = (q1 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
+  float p_cough = (COUGH_INDEX == 0) ? p0 : p1;
+  float p_non_cough = (COUGH_INDEX == 0) ? p1 : p0;
+
+  // ======================= NEW: Decision-level fusion (audio AND motion) =======================
+  bool audio_hit = (p_cough >= COUGH_THRESHOLD);
+  float motion_peak_dyn_g = 0.0f;
+  float motion_mean_dyn_g = 0.0f;
+  bool motion_window_ok = getMotionWindowMetric(MOTION_FUSION_WINDOW_MS, motion_peak_dyn_g, motion_mean_dyn_g);
+  bool motion_hit = motion_window_ok && (motion_peak_dyn_g >= ACCEL_MOTION_THRESHOLD_G);
+  bool fusion_hit = audio_hit && motion_hit;
+  // ======================= END NEW: Decision-level fusion (audio AND motion) =======================
+
+  // 4. Display results with timestamp and inference time
+  Serial.printf("[%lus] Window:[%lu-%lu]s Feature:%lu us Inference:%lu us Class0:%.4f Class1:%.4f Probabilities:[Cough:%.4f Non-Cough:%.4f]\n",
+                t_seconds, window_start_seconds, window_end_seconds,
+                featureTime, inferenceTime, p0, p1, p_cough, p_non_cough);
+  Serial.printf("      Audio[RMS=%.6f Peak=%.6f DC=%.6f] MFCC[qmin=%d qmax=%d mean|q-zp|=%.2f]\n",
+                rms, peak, dc, q_min, q_max, q_abs_mean);
+  // NEW: Motion + fusion telemetry for tuning thresholds.
+  Serial.printf("      Motion[peak_dyn=%.4fg mean_dyn=%.4fg win=%lums data=%s] Fusion[audio=%s motion=%s final=%s]\n",
+                motion_peak_dyn_g, motion_mean_dyn_g, MOTION_FUSION_WINDOW_MS,
+                motion_window_ok ? "yes" : "no",
+                audio_hit ? "hit" : "miss",
+                motion_hit ? "hit" : "miss",
+                fusion_hit ? "hit" : "miss");
+
+  if (peak < 0.003f || q_abs_mean < 0.75f)
+  {
+    Serial.println("      WARNING: Mic/features look too flat. Check INMP441 L/R pin, wiring, and I2S format.");
+  }
+
+  // 5. Detection logic (strict fusion gate)
+  if (audio_hit && !motion_hit)
+  {
+    Serial.println("      Audio hit but motion gate failed -> rejected.");
+  }
+
+  if (fusion_hit)
+  {
+    Serial.println("  >>> COUGH DETECTED (AUDIO + MOTION) <<<");
+
+    // Add your actions here
+  }
+}
 
 // ======================= SETUP =======================
 void setup()
@@ -70,7 +212,7 @@ void setup()
   Serial.println("==================================================");
 
   // 1. Initialize PSRAM and allocate buffers
-  Serial.println("\n[1/3] Initializing PSRAM...");
+  Serial.println("\n[1/4] Initializing PSRAM...");
   if (!initializePSRAM())
   {
     Serial.println(" SYSTEM HALTED: PSRAM initialization failed.");
@@ -84,7 +226,7 @@ void setup()
   audioProcessor.setAudioBuffer(g_audio_buffer_psram);
 
   // 2. Initialize TensorFlow Lite Model
-  Serial.println("\n[2/3] Initializing TensorFlow Lite Model...");
+  Serial.println("\n[2/4] Initializing TensorFlow Lite Model...");
   if (!initializeModel())
   {
     Serial.println(" SYSTEM HALTED: Model initialization failed.");
@@ -95,7 +237,7 @@ void setup()
   }
 
   // 3. Initialize Audio Processor
-  Serial.println("\n[3/3] Initializing Audio Processor...");
+  Serial.println("\n[3/4] Initializing Audio Processor...");
   if (!initializeAudioProcessor())
   {
     Serial.println(" SYSTEM HALTED: Audio processor initialization failed.");
@@ -105,8 +247,17 @@ void setup()
     }
   }
 
-  // Print final system status
-  // printSystemStatus();
+  // ======================= NEW: Initialize MPU6050 motion pipeline =======================
+  Serial.println("\n[4/4] Initializing Motion Pipeline (MPU6050)...");
+  if (!initializeMotionPipeline())
+  {
+    Serial.println(" SYSTEM HALTED: Motion pipeline initialization failed.");
+    while (1)
+    {
+      delay(1000);
+    }
+  }
+  // ======================= END NEW: Initialize MPU6050 motion pipeline =======================
 
   Serial.println("\n SYSTEM INITIALIZATION COMPLETE");
   Serial.println("   Listening for audio...");
@@ -125,6 +276,10 @@ void loop()
 
   unsigned long currentTime = millis();
 
+  // ======================= NEW: Keep IMU sampled at fixed cadence =======================
+  updateMotionPipeline();
+  // ======================= END NEW: Keep IMU sampled at fixed cadence =======================
+
   // 1. Continuously read audio from I2S microphone
   const int I2S_READ_BUFFER_SIZE = 512;
   static int32_t i2sBuffer[I2S_READ_BUFFER_SIZE];
@@ -132,6 +287,9 @@ void loop()
   int samplesRead = audioProcessor.read(i2sBuffer, I2S_READ_BUFFER_SIZE);
   (void)samplesRead;
 
+  // ======================= NEW: Catch up IMU sampling after blocking I2S read =======================
+  updateMotionPipeline();
+  // ======================= END NEW: Catch up IMU sampling after blocking I2S read =======================
 
   // 2. Run inference at regular intervals
   if (currentTime - lastInferenceTime >= INFERENCE_INTERVAL_MS)
@@ -139,20 +297,9 @@ void loop()
     // Check if we have enough audio collected
     if (audioProcessor.hasEnoughAudio())
     {
-      // Serial.printf("\n[%lu] Running inference...", currentTime / 1000);
       runInference();
       // Set timestamp after inference so we wait for fresh post-inference audio.
       lastInferenceTime = millis();
-    }
-    else
-    {
-      // Show collection progress
-      // int percent = (audioProcessor._samples_collected * 100) / ANALYSIS_SAMPLES;
-      // Serial.printf("\n[%lu] Collecting audio: %d%% (%d/%d samples)",
-      //               currentTime / 1000,
-      //               percent,
-      //               audioProcessor._samples_collected,
-      //               ANALYSIS_SAMPLES);
     }
   }
 
@@ -162,9 +309,6 @@ void loop()
   //   lastStatusTime = currentTime;
   //   printSystemStatus();
   // }
-
-  // Small delay to prevent watchdog issues
-  // delay(1);
 }
 
 // ======================= FUNCTION IMPLEMENTATIONS =======================
@@ -344,80 +488,230 @@ bool initializeAudioProcessor()
   return true;
 }
 
-void runInference()
+// ======================= NEW: MPU6050 MOTION PIPELINE IMPLEMENTATION =======================
+bool mpuWriteReg(uint8_t reg, uint8_t value)
 {
-  // Timestamp (seconds since boot) for this inference
-  unsigned long t_seconds = millis() / 1000;
-  unsigned long window_end_seconds = t_seconds;
-  unsigned long window_start_seconds = (window_end_seconds > ANALYSIS_SECONDS)
-                                           ? (window_end_seconds - ANALYSIS_SECONDS)
-                                           : 0;
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return (Wire.endTransmission() == 0);
+}
 
-  // 1. Extract MFCC features directly into PSRAM buffer
-  unsigned long featureStart = micros();
-  if (!audioProcessor.getMFCCFeatures(g_model_input_buffer))
+bool mpuReadRegs(uint8_t start_reg, uint8_t *buffer, size_t len)
+{
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(start_reg);
+  if (Wire.endTransmission(false) != 0)
   {
-    Serial.printf("[%lus] Failed to extract MFCC features.\n", t_seconds);
+    return false;
+  }
+
+  size_t received = Wire.requestFrom((int)MPU6050_ADDR, (int)len, (int)true);
+  if (received != len)
+  {
+    return false;
+  }
+
+  for (size_t i = 0; i < len; i++)
+  {
+    buffer[i] = (uint8_t)Wire.read();
+  }
+
+  return true;
+}
+
+bool readAccelInG(float &ax_g, float &ay_g, float &az_g)
+{
+  uint8_t raw[6];
+  if (!mpuReadRegs(0x3B, raw, sizeof(raw)))
+  {
+    return false;
+  }
+
+  int16_t ax = (int16_t)((raw[0] << 8) | raw[1]);
+  int16_t ay = (int16_t)((raw[2] << 8) | raw[3]);
+  int16_t az = (int16_t)((raw[4] << 8) | raw[5]);
+
+  // ±2g range -> 16384 LSB/g
+  const float ACC_LSB_PER_G = 16384.0f;
+  ax_g = ax / ACC_LSB_PER_G;
+  ay_g = ay / ACC_LSB_PER_G;
+  az_g = az / ACC_LSB_PER_G;
+  return true;
+}
+
+bool initializeMotionPipeline()
+{
+  Serial.println("--- Motion Pipeline Initialization ---");
+  Serial.printf("I2C pins: SDA=%d SCL=%d\n", IMU_I2C_SDA_PIN, IMU_I2C_SCL_PIN);
+
+  Wire.begin(IMU_I2C_SDA_PIN, IMU_I2C_SCL_PIN, IMU_I2C_FREQ_HZ);
+  Wire.setTimeOut(3);
+  delay(20);
+
+  // Verify WHO_AM_I
+  uint8_t who_am_i = 0;
+  if (!mpuReadRegs(0x75, &who_am_i, 1))
+  {
+    Serial.println(" Failed to read MPU6050 WHO_AM_I.");
+    return false;
+  }
+
+  if (who_am_i != 0x68 && who_am_i != 0x69)
+  {
+    Serial.printf(" Unexpected MPU6050 WHO_AM_I: 0x%02X\n", who_am_i);
+    return false;
+  }
+
+  // Reset then wake the sensor
+  if (!mpuWriteReg(0x6B, 0x80))
+  {
+    Serial.println(" Failed to reset MPU6050.");
+    return false;
+  }
+  delay(100);
+  if (!mpuWriteReg(0x6B, 0x00))
+  {
+    Serial.println(" Failed to wake MPU6050.");
+    return false;
+  }
+  delay(10);
+
+  // DLPF and sample-rate config: 100 Hz output
+  if (!mpuWriteReg(0x1A, 0x03))
+  {
+    Serial.println(" Failed to set MPU6050 DLPF.");
+    return false;
+  }
+  if (!mpuWriteReg(0x19, 0x09))
+  {
+    Serial.println(" Failed to set MPU6050 sample divider.");
+    return false;
+  }
+
+  // Accelerometer ±2g full-scale (best resolution for cough motion gate)
+  if (!mpuWriteReg(0x1C, 0x00))
+  {
+    Serial.println(" Failed to set MPU6050 accel range.");
+    return false;
+  }
+
+  // Startup calibration while stationary
+  Serial.printf("Calibrating accelerometer (%d samples)... keep device still.\n", MOTION_CALIB_SAMPLES);
+  float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+  for (int i = 0; i < MOTION_CALIB_SAMPLES; i++)
+  {
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    if (!readAccelInG(ax, ay, az))
+    {
+      Serial.println(" Failed reading accelerometer during calibration.");
+      return false;
+    }
+    sx += ax;
+    sy += ay;
+    sz += az;
+    delay(10);
+  }
+
+  g_acc_bias_x = sx / MOTION_CALIB_SAMPLES;
+  g_acc_bias_y = sy / MOTION_CALIB_SAMPLES;
+  g_acc_bias_z = (sz / MOTION_CALIB_SAMPLES) - 1.0f;
+
+  g_motion_write_idx = 0;
+  g_motion_count = 0;
+  g_next_motion_sample_us = micros() + (1000000UL / MOTION_SAMPLE_RATE_HZ);
+  g_motion_sensor_ready = true;
+
+  Serial.printf("MPU6050 ready (WHO_AM_I=0x%02X)\n", who_am_i);
+  Serial.printf("Accel bias: x=%.4fg y=%.4fg z=%.4fg\n", g_acc_bias_x, g_acc_bias_y, g_acc_bias_z);
+  Serial.printf("Motion gate: window=%lu ms threshold=%.3fg\n",
+                MOTION_FUSION_WINDOW_MS, ACCEL_MOTION_THRESHOLD_G);
+  return true;
+}
+
+void updateMotionPipeline()
+{
+  if (!g_motion_sensor_ready)
+  {
     return;
   }
-  unsigned long featureTime = micros() - featureStart;
 
-  // Debug telemetry to verify that mic signal and MFCC input are changing
-  float rms = 0.0f, peak = 0.0f, dc = 0.0f;
-  audioProcessor.getAudioStats(rms, peak, dc);
+  uint32_t now_us = micros();
+  const uint32_t sample_period_us = 1000000UL / MOTION_SAMPLE_RATE_HZ;
 
-  int q_min = 127;
-  int q_max = -128;
-  long q_abs_sum = 0;
-  for (int i = 0; i < NUM_INPUTS; i++)
+  // Catch-up loop ensures fixed-rate sampling even if loop had blocking work.
+  while ((int32_t)(now_us - g_next_motion_sample_us) >= 0)
   {
-    int q = (int)g_model_input_buffer[i];
-    if (q < q_min)
-      q_min = q;
-    if (q > q_max)
-      q_max = q;
-    q_abs_sum += abs(q - MODEL_INPUT_ZERO_POINT);
-  }
-  float q_abs_mean = (float)q_abs_sum / (float)NUM_INPUTS;
+    g_next_motion_sample_us += sample_period_us;
 
-  // 2. Run inference
-  unsigned long startTime = micros();
-  auto predictStatus = tf.predict(g_model_input_buffer);
-  unsigned long inferenceTime = micros() - startTime;
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    if (!readAccelInG(ax, ay, az))
+    {
+      break;
+    }
 
-  if (!predictStatus.isOk())
-  {
-    Serial.printf("[%lus] Inference failed: %s\n", t_seconds, predictStatus.toString().c_str());
-    return;
-  }
+    // Apply calibration bias and compute dynamic acceleration magnitude.
+    ax -= g_acc_bias_x;
+    ay -= g_acc_bias_y;
+    az -= g_acc_bias_z;
+    float acc_mag_g = sqrtf(ax * ax + ay * ay + az * az);
+    float dyn_acc_g = fabsf(acc_mag_g - 1.0f);
 
-  // 3. Dequantize and process results
-  int q0 = (int)round(tf.output(0));
-  int q1 = (int)round(tf.output(1));
+    g_motion_ring[g_motion_write_idx].dyn_acc_g = dyn_acc_g;
+    g_motion_ring[g_motion_write_idx].t_ms = millis();
+    g_motion_write_idx = (g_motion_write_idx + 1) % MOTION_RING_SIZE;
+    if (g_motion_count < MOTION_RING_SIZE)
+    {
+      g_motion_count++;
+    }
 
-  // Dequantize
-  float p0 = (q0 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
-  float p1 = (q1 - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
-  float p_cough = (COUGH_INDEX == 0) ? p0 : p1;
-  float p_non_cough = (COUGH_INDEX == 0) ? p1 : p0;
-
-  // 4. Display results with timestamp and inference time
-  Serial.printf("[%lus] Window:[%lu-%lu]s Feature:%lu us Inference:%lu us Class0:%.4f Class1:%.4f Probabilities:[Cough:%.4f Non-Cough:%.4f]\n",
-                t_seconds, window_start_seconds, window_end_seconds,
-                featureTime, inferenceTime, p0, p1, p_cough, p_non_cough);
-  Serial.printf("      Audio[RMS=%.6f Peak=%.6f DC=%.6f] MFCC[qmin=%d qmax=%d mean|q-zp|=%.2f]\n",
-                rms, peak, dc, q_min, q_max, q_abs_mean);
-
-  if (peak < 0.003f || q_abs_mean < 0.75f)
-  {
-    Serial.println("      WARNING: Mic/features look too flat. Check INMP441 L/R pin, wiring, and I2S format.");
-  }
-
-  // 5. Detection logic (single threshold)
-  if (p_cough >= COUGH_THRESHOLD)
-  {
-    Serial.println("  🚨🚨🚨🚨🚨🚨🚨 COUGH DETECTED! 🚨🚨🚨🚨🚨🚨🚨");
-
-    // Add your actions here
+    now_us = micros();
   }
 }
+
+bool getMotionWindowMetric(uint32_t window_ms, float &peak_dyn_acc_g, float &mean_dyn_acc_g)
+{
+  peak_dyn_acc_g = 0.0f;
+  mean_dyn_acc_g = 0.0f;
+
+  if (!g_motion_sensor_ready || g_motion_count <= 0)
+  {
+    return false;
+  }
+
+  uint32_t now_ms = millis();
+  uint32_t cutoff_ms = (now_ms > window_ms) ? (now_ms - window_ms) : 0;
+
+  int matched = 0;
+  float sum = 0.0f;
+  for (int i = 0; i < g_motion_count; i++)
+  {
+    int idx = g_motion_write_idx - 1 - i;
+    if (idx < 0)
+    {
+      idx += MOTION_RING_SIZE;
+    }
+
+    const MotionSample &sample = g_motion_ring[idx];
+    if (sample.t_ms < cutoff_ms)
+    {
+      break;
+    }
+
+    if (sample.dyn_acc_g > peak_dyn_acc_g)
+    {
+      peak_dyn_acc_g = sample.dyn_acc_g;
+    }
+    sum += sample.dyn_acc_g;
+    matched++;
+  }
+
+  if (matched <= 0)
+  {
+    return false;
+  }
+
+  mean_dyn_acc_g = sum / matched;
+  return true;
+}
+// ======================= END NEW: MPU6050 MOTION PIPELINE IMPLEMENTATION =======================
