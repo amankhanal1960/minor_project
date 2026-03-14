@@ -1,74 +1,101 @@
-﻿type Severity = "Low" | "Medium" | "High";
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:5000/api";
 
-type CoughEvent = {
-  id: number;
-  timestamp: string;
-  confidence: number;
-  motionDetected: boolean;
-  durationMs: number;
-  severity: Severity;
+type Severity = "Low" | "Medium" | "High";
+
+type Detection = {
+  id: string;
+  deviceId: string;
+  coughProbability: number;
+  audioLevel: number;
+  detectionAt: string;
 };
 
-const coughEvents: CoughEvent[] = [
-  {
-    id: 1,
-    timestamp: "2026-03-02 14:27:18",
-    confidence: 0.93,
-    motionDetected: true,
-    durationMs: 670,
-    severity: "High",
-  },
-  {
-    id: 2,
-    timestamp: "2026-03-02 13:11:52",
-    confidence: 0.87,
-    motionDetected: true,
-    durationMs: 540,
-    severity: "Medium",
-  },
-  {
-    id: 3,
-    timestamp: "2026-03-02 11:44:09",
-    confidence: 0.78,
-    motionDetected: true,
-    durationMs: 460,
-    severity: "Low",
-  },
-  {
-    id: 4,
-    timestamp: "2026-03-02 09:58:36",
-    confidence: 0.90,
-    motionDetected: true,
-    durationMs: 620,
-    severity: "High",
-  },
-  {
-    id: 5,
-    timestamp: "2026-03-02 08:36:04",
-    confidence: 0.82,
-    motionDetected: true,
-    durationMs: 500,
-    severity: "Medium",
-  },
-];
+type EventVM = {
+  id: string;
+  timestamp: string;
+  probabilityPct: number;
+  audioLevel: number;
+  deviceId: string;
+  severity: Severity;
+  rawDate: string;
+};
 
-const hourlyCount = [
-  { hour: "08", count: 1 },
-  { hour: "09", count: 1 },
-  { hour: "10", count: 0 },
-  { hour: "11", count: 1 },
-  { hour: "12", count: 0 },
-  { hour: "13", count: 1 },
-  { hour: "14", count: 1 },
-];
+function classifySeverity(probability: number): Severity {
+  if (probability >= 0.8) return "High";
+  if (probability >= 0.5) return "Medium";
+  return "Low";
+}
 
-const totalCoughs = coughEvents.length;
-const averageConfidence = Math.round(
-  (coughEvents.reduce((sum, event) => sum + event.confidence, 0) / totalCoughs) * 100,
-);
-const motionConfirmedCount = coughEvents.filter((event) => event.motionDetected).length;
-const latestTimestamp = coughEvents[0]?.timestamp ?? "No event";
-const maxHourly = Math.max(...hourlyCount.map((entry) => entry.count), 1);
+function formatTime(value: string) {
+  return new Date(value).toLocaleString();
+}
+
+async function fetchDetections(): Promise<Detection[]> {
+  try {
+    const res = await fetch(`${API_BASE}/detections`, { cache: "no-store" });
+    if (!res.ok) throw new Error("Failed to fetch detections");
+    return (await res.json()) as Detection[];
+  } catch (err) {
+    console.error("Failed to load detections", err);
+    return [];
+  }
+}
+
+function buildViewModel(detections: Detection[]): {
+  events: EventVM[];
+  hourly: { hour: string; count: number }[];
+  summary: {
+    total: number;
+    avgProbabilityPct: number;
+    avgAudio: number;
+    latest: string;
+  };
+} {
+  const events = detections
+    .sort(
+      (a, b) =>
+        new Date(b.detectionAt).getTime() - new Date(a.detectionAt).getTime(),
+    )
+    .map((d) => ({
+      id: d.id,
+      timestamp: formatTime(d.detectionAt),
+      rawDate: d.detectionAt,
+      probabilityPct: Math.round(d.coughProbability * 100),
+      audioLevel: d.audioLevel,
+      deviceId: d.deviceId,
+      severity: classifySeverity(d.coughProbability),
+    }));
+
+  const total = events.length;
+  const avgProbabilityPct =
+    total === 0
+      ? 0
+      : Math.round(
+          events.reduce((sum, e) => sum + e.probabilityPct, 0) / total,
+        );
+  const avgAudio =
+    total === 0
+      ? 0
+      : Math.round(events.reduce((sum, e) => sum + e.audioLevel, 0) / total);
+  const latest = events[0]?.timestamp ?? "No data yet";
+
+  const hourlyMap = new Map<string, number>();
+  events.forEach((e) => {
+    const hour = new Date(e.rawDate).getHours().toString().padStart(2, "0");
+    hourlyMap.set(hour, (hourlyMap.get(hour) ?? 0) + 1);
+  });
+  const hourly = Array.from({ length: 24 }, (_, i) => {
+    const hour = i.toString().padStart(2, "0");
+    return { hour, count: hourlyMap.get(hour) ?? 0 };
+  }).filter((entry) => entry.count > 0);
+
+  return {
+    events,
+    hourly,
+    summary: { total, avgProbabilityPct, avgAudio, latest },
+  };
+}
 
 const severityClassMap: Record<Severity, string> = {
   High: "event-chip-high",
@@ -76,7 +103,11 @@ const severityClassMap: Record<Severity, string> = {
   Low: "event-chip-low",
 };
 
-export default function Home() {
+export default async function Home() {
+  const detections = await fetchDetections();
+  const { events, hourly, summary } = buildViewModel(detections);
+  const maxHourly = Math.max(...hourly.map((entry) => entry.count), 1);
+
   return (
     <div className="min-h-screen px-4 py-6 sm:px-8 sm:py-10">
       <main className="mx-auto flex w-full max-w-6xl flex-col gap-5 sm:gap-6">
@@ -88,18 +119,18 @@ export default function Home() {
                 Patient Cough Activity
               </h1>
               <p className="max-w-2xl text-sm text-[color:var(--muted)] sm:text-base">
-                Static UI mock for real-time monitoring. Counts and timestamps are shown from
-                sample data now, then this same shape can be fed by WebSocket events.
+                Live data from backend detections. Add a device and POST
+                detections to see them here.
               </p>
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
               <span className="live-badge">
                 <span className="live-dot" />
-                Static Feed (WebSocket-ready)
+                Live Feed (poll on load)
               </span>
               <div className="rounded-full border border-[color:var(--line)] bg-white px-4 py-2 text-sm">
-                Last update: <span className="font-mono">{latestTimestamp}</span>
+                Last update: <span className="font-mono">{summary.latest}</span>
               </div>
             </div>
           </div>
@@ -108,26 +139,36 @@ export default function Home() {
         <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <article className="surface reveal-1 p-5">
             <p className="section-title">Total Coughs</p>
-            <p className="value mt-3 text-4xl">{totalCoughs}</p>
-            <p className="mt-2 text-sm text-[color:var(--muted)]">Current day</p>
+            <p className="value mt-3 text-4xl">{summary.total}</p>
+            <p className="mt-2 text-sm text-[color:var(--muted)]">
+              Current day
+            </p>
           </article>
 
           <article className="surface reveal-1 p-5">
-            <p className="section-title">Avg Audio Confidence</p>
-            <p className="value mt-3 text-4xl">{averageConfidence}%</p>
-            <p className="mt-2 text-sm text-[color:var(--muted)]">From accepted events</p>
+            <p className="section-title">Avg Cough Probability</p>
+            <p className="value mt-3 text-4xl">{summary.avgProbabilityPct}%</p>
+            <p className="mt-2 text-sm text-[color:var(--muted)]">
+              From detections received
+            </p>
           </article>
 
           <article className="surface reveal-2 p-5">
-            <p className="section-title">Motion Confirmed</p>
-            <p className="value mt-3 text-4xl">{motionConfirmedCount}</p>
-            <p className="mt-2 text-sm text-[color:var(--muted)]">Decision-level fusion pass</p>
+            <p className="section-title">Avg Audio Level</p>
+            <p className="value mt-3 text-4xl">{summary.avgAudio}</p>
+            <p className="mt-2 text-sm text-[color:var(--muted)]">
+              Linear scale from payload
+            </p>
           </article>
 
           <article className="surface reveal-2 p-5">
             <p className="section-title">System State</p>
-            <p className="value mt-3 text-3xl text-[color:var(--good)]">Monitoring</p>
-            <p className="mt-2 text-sm text-[color:var(--muted)]">No stream errors (mock)</p>
+            <p className="value mt-3 text-3xl text-[color:var(--good)]">
+              Monitoring
+            </p>
+            <p className="mt-2 text-sm text-[color:var(--muted)]">
+              Backend reachable
+            </p>
           </article>
         </section>
 
@@ -141,34 +182,57 @@ export default function Home() {
             </div>
 
             <div className="space-y-3">
-              {coughEvents.map((event) => (
+              {events.map((event) => (
                 <div
                   key={event.id}
                   className="event-item grid gap-3 p-4 md:grid-cols-[1.5fr_1fr_1fr_0.8fr] md:items-center"
                 >
                   <div>
-                    <p className="text-xs text-[color:var(--muted)]">Timestamp</p>
-                    <p className="font-mono text-sm font-semibold sm:text-base">{event.timestamp}</p>
+                    <p className="text-xs text-[color:var(--muted)]">
+                      Timestamp
+                    </p>
+                    <p className="font-mono text-sm font-semibold sm:text-base">
+                      {event.timestamp}
+                    </p>
                   </div>
 
                   <div>
-                    <p className="text-xs text-[color:var(--muted)]">Confidence</p>
-                    <p className="font-mono text-sm font-semibold">{Math.round(event.confidence * 100)}%</p>
+                    <p className="text-xs text-[color:var(--muted)]">
+                      Cough Probability
+                    </p>
+                    <p className="font-mono text-sm font-semibold">
+                      {event.probabilityPct}%
+                    </p>
                   </div>
 
                   <div>
-                    <p className="text-xs text-[color:var(--muted)]">Duration</p>
-                    <p className="font-mono text-sm font-semibold">{event.durationMs} ms</p>
+                    <p className="text-xs text-[color:var(--muted)]">
+                      Audio Level
+                    </p>
+                    <p className="font-mono text-sm font-semibold">
+                      {event.audioLevel}
+                    </p>
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2 md:justify-end">
-                    <span className={`event-chip ${severityClassMap[event.severity]}`}>
+                    <span
+                      className={`event-chip ${severityClassMap[event.severity]}`}
+                    >
                       {event.severity}
                     </span>
-                    <span className="event-chip bg-[#e9f4ef] text-[#205a43]">Motion: yes</span>
+                    <span className="event-chip bg-[#e9f4ef] text-[#205a43]">
+                      Device: {event.deviceId}
+                    </span>
                   </div>
                 </div>
               ))}
+
+              {events.length === 0 && (
+                <div className="rounded-lg border border-dashed border-[color:var(--line)] p-6 text-sm text-[color:var(--muted)]">
+                  No detections yet. POST to <code>/api/detections</code> to see
+                  data appear.
+                </div>
+              )}
             </div>
           </article>
 
@@ -176,18 +240,28 @@ export default function Home() {
             <article className="surface reveal-3 p-5 sm:p-6">
               <h2 className="mb-4 text-xl font-semibold">Hourly Trend</h2>
               <div className="grid-bars">
-                {hourlyCount.map((entry) => (
+                {hourly.map((entry) => (
                   <div key={entry.hour} className="bar-row">
-                    <span className="font-mono text-xs text-[color:var(--muted)]">{entry.hour}:00</span>
+                    <span className="font-mono text-xs text-[color:var(--muted)]">
+                      {entry.hour}:00
+                    </span>
                     <div className="bar-track">
                       <div
                         className="bar-fill"
                         style={{ width: `${(entry.count / maxHourly) * 100}%` }}
                       />
                     </div>
-                    <span className="font-mono text-xs font-semibold">{entry.count}</span>
+                    <span className="font-mono text-xs font-semibold">
+                      {entry.count}
+                    </span>
                   </div>
                 ))}
+
+                {hourly.length === 0 && (
+                  <p className="text-sm text-[color:var(--muted)]">
+                    No detections to plot yet.
+                  </p>
+                )}
               </div>
             </article>
 
@@ -197,12 +271,11 @@ export default function Home() {
                 Keep this event payload shape when switching to live data:
               </p>
               <pre className="mt-4 overflow-x-auto rounded-xl border border-[color:var(--line)] bg-[#f7faf4] p-3 text-xs leading-relaxed text-[#264033]">
-{`{
-  "timestamp": "2026-03-02 14:27:18",
-  "confidence": 0.93,
-  "motionDetected": true,
-  "durationMs": 670,
-  "severity": "High"
+                {`{
+  "deviceId": "device-1234",
+  "coughProbability": 0.82,
+  "audioLevel": 89,
+  "detectionAt": "2026-03-13T09:56:45.384Z"
 }`}
               </pre>
             </article>

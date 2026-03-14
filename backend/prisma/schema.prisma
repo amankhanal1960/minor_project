@@ -1,0 +1,61 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Device {
+  id        String        @id @default(cuid())
+  name      String
+  tokenHash String
+  status    DeviceStatus  @default(ONLINE)
+  lastSeen  DateTime      @default(now())
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  events    Event[]
+  detections Detection[]
+}
+
+model Event {
+  id          String   @id @default(cuid())
+  deviceId    String
+  ts          BigInt
+  coughProb   Float
+  motionPeakG Float?
+  fusionHit   Boolean  @default(false)
+  rms         Float?
+  durationMs  Int?
+  severity    Severity @default(LOW)
+  createdAt   DateTime @default(now())
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId, ts], name: "idx_event_device_ts")
+  @@index([ts], name: "idx_event_ts")
+}
+
+model Detection {
+  id               String   @id @default(cuid())
+  deviceId         String
+  coughProbability Float
+  audioLevel       Float
+  detectionAt      DateTime @default(now())
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId, detectionAt], name: "idx_detection_device_time")
+}
+
+enum DeviceStatus {
+  ONLINE
+  OFFLINE
+  UNKNOWN
+}
+
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+}
