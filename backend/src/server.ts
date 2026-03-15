@@ -1,7 +1,8 @@
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
-import router from "./routes/detection.route";
+import detectionRouter from "./routes/detection.route";
+import deviceRouter from "./routes/device.route";
 
 dotenv.config();
 
@@ -15,7 +16,8 @@ app.use(
 
 app.use(express.json());
 
-app.use("/api", router);
+app.use("/api", detectionRouter);
+app.use("/api", deviceRouter);
 
 app.get("/", (req, res) => {
   res.send("API running");

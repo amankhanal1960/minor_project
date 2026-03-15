@@ -1,9 +1,23 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include <tflm_esp32.h>
 #include <eloquent_tinyml.h>
 #include "model_data_5s.h"
 #include "audio_processor.h"
+
+// ======================= NETWORK / BACKEND CONFIG =======================
+// TODO: replace with your Wi‑Fi credentials
+const char *WIFI_SSID = "YOUR_WIFI_SSID";
+const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+// TODO: replace with your registered device ID from the backend
+const char *DEVICE_ID = "YOUR_DEVICE_ID_FROM_API";
+
+// Backend base URL (no trailing slash)
+const char *API_BASE = "http://192.168.0.10:5000/api";
+// ======================= END NETWORK CONFIG =======================
 
 // ======================= HARDWARE CONFIG =======================
 // IMPORTANT: These GPIO numbers must match your physical wiring!
@@ -88,6 +102,8 @@ float g_acc_bias_z = 0.0f;
 bool initializePSRAM();
 bool initializeModel();
 bool initializeAudioProcessor();
+bool connectWiFi();
+bool postDetection(float coughProb, float audioLevel, float motionPeakG);
 // ======================= NEW: MOTION PIPELINE DECLARATIONS =======================
 bool initializeMotionPipeline();
 void updateMotionPipeline();
@@ -191,7 +207,8 @@ void runInference()
   {
     Serial.println("  >>> COUGH DETECTED (AUDIO + MOTION) <<<");
 
-    // Add your actions here
+    // Send event to backend
+    postDetection(p_cough, peak, motion_peak_dyn_g);
   }
 }
 
@@ -210,6 +227,17 @@ void setup()
   Serial.println("\n==================================================");
   Serial.println("     ESP32-S3 REAL-TIME COUGH DETECTION SYSTEM");
   Serial.println("==================================================");
+
+  // Connect Wi‑Fi early so network is ready when detections occur
+  Serial.println("\n[0/4] Connecting Wi‑Fi...");
+  if (!connectWiFi())
+  {
+    Serial.println(" SYSTEM HALTED: Wi‑Fi connection failed.");
+    while (1)
+    {
+      delay(1000);
+    }
+  }
 
   // 1. Initialize PSRAM and allocate buffers
   Serial.println("\n[1/4] Initializing PSRAM...");
@@ -312,6 +340,70 @@ void loop()
 }
 
 // ======================= FUNCTION IMPLEMENTATIONS =======================
+
+bool connectWiFi()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.printf(" Connecting to Wi-Fi SSID '%s'...\n", WIFI_SSID);
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < 15000)
+  {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.printf(" Wi-Fi connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  }
+
+  Serial.println(" Wi-Fi connection timed out.");
+  return false;
+}
+
+bool postDetection(float coughProb, float audioLevel, float motionPeakG)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println(" Wi-Fi dropped, reconnecting...");
+    if (!connectWiFi())
+    {
+      Serial.println(" Reconnect failed, skipping POST.");
+      return false;
+    }
+  }
+
+  String url = String(API_BASE) + "/detections";
+  String payload;
+  payload.reserve(128);
+  payload += "{\"deviceId\":\"";
+  payload += DEVICE_ID;
+  payload += "\",\"coughProbability\":";
+  payload += String(coughProb, 4);
+  payload += ",\"audioLevel\":";
+  payload += String(audioLevel, 4);
+  payload += "}";
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int code = http.POST(payload);
+  if (code > 0)
+  {
+    Serial.printf(" POST /detections -> %d\n", code);
+  }
+  else
+  {
+    Serial.printf(" POST failed: %s\n", http.errorToString(code).c_str());
+  }
+  http.end();
+  return code == 200 || code == 201;
+}
 
 bool initializePSRAM()
 {

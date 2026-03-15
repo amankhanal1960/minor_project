@@ -31,14 +31,14 @@ function formatTime(value: string) {
   return new Date(value).toLocaleString();
 }
 
-async function fetchDetections(): Promise<Detection[]> {
+async function fetchDetections(): Promise<{ ok: boolean; data: Detection[] }> {
   try {
     const res = await fetch(`${API_BASE}/detections`, { cache: "no-store" });
     if (!res.ok) throw new Error("Failed to fetch detections");
-    return (await res.json()) as Detection[];
+    return { ok: true, data: (await res.json()) as Detection[] };
   } catch (err) {
     console.error("Failed to load detections", err);
-    return [];
+    return { ok: false, data: [] };
   }
 }
 
@@ -88,13 +88,24 @@ function buildViewModel(detections: Detection[]): {
   const hourly = Array.from({ length: 24 }, (_, i) => {
     const hour = i.toString().padStart(2, "0");
     return { hour, count: hourlyMap.get(hour) ?? 0 };
-  }).filter((entry) => entry.count > 0);
+  });
 
   return {
     events,
     hourly,
     summary: { total, avgProbabilityPct, avgAudio, latest },
   };
+}
+
+function hourlyPolyline(hours: { hour: string; count: number }[], height = 40) {
+  const max = Math.max(1, ...hours.map((h) => h.count));
+  return hours
+    .map((h, i) => {
+      const x = (i / (hours.length - 1)) * 100;
+      const y = 100 - (h.count / max) * 100;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(" ");
 }
 
 const severityClassMap: Record<Severity, string> = {
@@ -104,9 +115,10 @@ const severityClassMap: Record<Severity, string> = {
 };
 
 export default async function Home() {
-  const detections = await fetchDetections();
-  const { events, hourly, summary } = buildViewModel(detections);
+  const { ok, data } = await fetchDetections();
+  const { events, hourly, summary } = buildViewModel(data);
   const maxHourly = Math.max(...hourly.map((entry) => entry.count), 1);
+  const apiBase = API_BASE;
 
   return (
     <div className="min-h-screen px-4 py-6 sm:px-8 sm:py-10">
@@ -131,6 +143,15 @@ export default async function Home() {
               </span>
               <div className="rounded-full border border-[color:var(--line)] bg-white px-4 py-2 text-sm">
                 Last update: <span className="font-mono">{summary.latest}</span>
+              </div>
+              <div
+                className={`rounded-full border px-4 py-2 text-sm ${
+                  ok
+                    ? "border-[color:var(--good-line)] text-[color:var(--good)]"
+                    : "border-[color:var(--bad-line)] text-[color:var(--bad)]"
+                }`}
+              >
+                Backend {ok ? "online" : "offline"}
               </div>
             </div>
           </div>
@@ -164,10 +185,10 @@ export default async function Home() {
           <article className="surface reveal-2 p-5">
             <p className="section-title">System State</p>
             <p className="value mt-3 text-3xl text-[color:var(--good)]">
-              Monitoring
+              {ok ? "Monitoring" : "Offline"}
             </p>
             <p className="mt-2 text-sm text-[color:var(--muted)]">
-              Backend reachable
+              {ok ? "Backend reachable" : "Cannot reach backend"}
             </p>
           </article>
         </section>
@@ -238,47 +259,60 @@ export default async function Home() {
 
           <aside className="space-y-5">
             <article className="surface reveal-3 p-5 sm:p-6">
-              <h2 className="mb-4 text-xl font-semibold">Hourly Trend</h2>
-              <div className="grid-bars">
-                {hourly.map((entry) => (
-                  <div key={entry.hour} className="bar-row">
-                    <span className="font-mono text-xs text-[color:var(--muted)]">
-                      {entry.hour}:00
-                    </span>
-                    <div className="bar-track">
-                      <div
-                        className="bar-fill"
-                        style={{ width: `${(entry.count / maxHourly) * 100}%` }}
-                      />
-                    </div>
-                    <span className="font-mono text-xs font-semibold">
-                      {entry.count}
-                    </span>
+              <h2 className="mb-2 text-xl font-semibold">Hourly Trend (24h)</h2>
+              <p className="text-sm text-[color:var(--muted)]">
+                Cough detections per clock hour (local time).
+              </p>
+              <div className="mt-4">
+                <div className="w-full overflow-hidden rounded-xl border border-[color:var(--line)] bg-white p-3">
+                  <svg viewBox="0 0 100 40" className="h-32 w-full">
+                    <defs>
+                      <linearGradient id="areaFill" x1="0" x2="0" y1="0" y2="1">
+                        <stop offset="0%" stopColor="#a7e0c2" stopOpacity="0.35" />
+                        <stop offset="100%" stopColor="#a7e0c2" stopOpacity="0" />
+                      </linearGradient>
+                    </defs>
+                    <polyline
+                      fill="url(#areaFill)"
+                      stroke="none"
+                      points={`0,100 ${hourlyPolyline(hourly)} 100,100`}
+                    />
+                    <polyline
+                      fill="none"
+                      stroke="#1b8f5a"
+                      strokeWidth="1.5"
+                      points={hourlyPolyline(hourly)}
+                    />
+                    {hourly.map((h, i) => {
+                      const x = (i / (hourly.length - 1)) * 100;
+                      const max = Math.max(1, maxHourly);
+                      const y = 100 - (h.count / max) * 100;
+                      return (
+                        <circle
+                          key={h.hour}
+                          cx={x}
+                          cy={y}
+                          r={1.3}
+                          fill="#1b8f5a"
+                          opacity={h.count > 0 ? 1 : 0.25}
+                        />
+                      );
+                    })}
+                  </svg>
+                  <div className="mt-2 flex flex-wrap justify-between text-xs font-mono text-[color:var(--muted)]">
+                    <span>00h</span>
+                    <span>06h</span>
+                    <span>12h</span>
+                    <span>18h</span>
+                    <span>23h</span>
                   </div>
-                ))}
-
-                {hourly.length === 0 && (
-                  <p className="text-sm text-[color:var(--muted)]">
-                    No detections to plot yet.
-                  </p>
-                )}
+                </div>
+                <p className="mt-2 text-xs text-[color:var(--muted)]">
+                  Peak: {Math.max(...hourly.map((h) => h.count))} events in an hour.
+                </p>
               </div>
             </article>
 
-            <article className="surface reveal-3 p-5 sm:p-6">
-              <h2 className="text-xl font-semibold">WebSocket Mapping</h2>
-              <p className="mt-3 text-sm text-[color:var(--muted)]">
-                Keep this event payload shape when switching to live data:
-              </p>
-              <pre className="mt-4 overflow-x-auto rounded-xl border border-[color:var(--line)] bg-[#f7faf4] p-3 text-xs leading-relaxed text-[#264033]">
-                {`{
-  "deviceId": "device-1234",
-  "coughProbability": 0.82,
-  "audioLevel": 89,
-  "detectionAt": "2026-03-13T09:56:45.384Z"
-}`}
-              </pre>
-            </article>
           </aside>
         </section>
       </main>
