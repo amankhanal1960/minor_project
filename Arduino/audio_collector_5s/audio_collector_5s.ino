@@ -194,3 +194,57 @@ void loop() {
     sendClip((uint8_t)cmd);
   }
 }
+
+
+// #include "Wire.h"
+// #include "MPU6050.h"
+
+// MPU6050 mpu;
+
+// void setup() {
+//     delay(3000); 
+//     Serial.begin(115200);
+    
+//     // 1. Initialize I2C with specific S3 pins and SLOWER clock
+//     // sda 9 scl 10
+//     Wire.begin(10, 9); 
+//     Wire.setClock(100000); // 100kHz is much more stable for testing
+//     delay(100);
+
+//     Serial.println("Force-Waking MPU6050...");
+    
+//     // 2. Direct Register Write: Wake up the chip
+//     // PWR_MGMT_1 is register 0x6B. Setting it to 0 wakes it up.
+//     Wire.beginTransmission(0x68);
+//     Wire.write(0x6B); 
+//     Wire.write(0x00); 
+//     if (Wire.endTransmission() != 0) {
+//         Serial.println("I2C Write Failed - Check wires again.");
+//     }
+    
+//     delay(200); // Give the chip time to stabilize after waking
+
+//     // 3. Now verify with the library
+//     uint8_t devID = mpu.getDeviceID();
+//     Serial.print("Device ID reported: 0x");
+//     Serial.println(devID, HEX);
+
+//     if (devID == 0x34 || devID == 0x68) { // MPU6050 usually returns 0x34 or 0x68
+//         Serial.println("SUCCESS: Sensor is awake and responding!");
+//         mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+//     } else {
+//         Serial.println("ERROR: Still getting wrong ID. Try swapping SDA/SCL pins?");
+//     }
+// }
+
+// void loop() {
+//     int16_t ax, ay, az;
+//     mpu.getAcceleration(&ax, &ay, &az);
+
+//     // Format for Serial Plotter
+//     Serial.print(ax); Serial.print("\t");
+//     Serial.print(ay); Serial.print("\t");
+//     Serial.println(az);
+
+//     delay(20); 
+// }

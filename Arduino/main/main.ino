@@ -4,66 +4,55 @@
 #include <HTTPClient.h>
 #include <tflm_esp32.h>
 #include <eloquent_tinyml.h>
-#include "model_data_5s.h"
+#include "model_data_5s_transfer.h"
 #include "audio_processor.h"
 
 // ======================= NETWORK / BACKEND CONFIG =======================
 // TODO: replace with your Wi‑Fi credentials
-const char *WIFI_SSID = "YOUR_WIFI_SSID";
-const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char *WIFI_SSID = "Aman Pixel";
+const char *WIFI_PASS = "12345678";
 
 // TODO: replace with your registered device ID from the backend
-const char *DEVICE_ID = "YOUR_DEVICE_ID_FROM_API";
+const char *DEVICE_ID = "device-123";
 
 // Backend base URL (no trailing slash)
-const char *API_BASE = "http://192.168.0.10:5000/api";
+const char *API_BASE = "http://10.237.133.1:5000/api";
 // ======================= END NETWORK CONFIG =======================
 
 // ======================= HARDWARE CONFIG =======================
-// IMPORTANT: These GPIO numbers must match your physical wiring!
-// On ESP32-S3, GPIO labels on PCB may differ from actual GPIO numbers.
-// Check your board's pinout diagram to find which physical pins correspond
-// to these GPIO numbers, then wire INMP441 accordingly:
-//   INMP441 SCK -> GPIO I2S_BCK_PIN
-//   INMP441 WS  -> GPIO I2S_WS_PIN
-//   INMP441 SD  -> GPIO I2S_SD_PIN
-//   INMP441 L/R -> GND
-//   INMP441 VCC -> 3.3V
-//   INMP441 GND -> GND
-//
-// Common safe GPIOs for I2S on ESP32-S3 (avoid GPIO 0, 3, 45, 46 which are strapping pins):
-// GPIO 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, etc.
-// Update these to match your actual wiring:
+
 #define I2S_BCK_PIN 5 // Bit clock - connect to INMP441 SCK
 #define I2S_WS_PIN 4  // Word select - connect to INMP441 WS
 #define I2S_SD_PIN 6  // Serial data - connect to INMP441 SD
 #define I2S_PORT I2S_NUM_0
 
 // ======================= NEW: MPU6050 MOTION GATE CONFIG =======================
-// NEW: I2C pins for MPU6050. Change to match your wiring.
-// NEW: Keep these different from I2S pins used by the microphone.
-#define IMU_I2C_SDA_PIN 8
+// NEW: I2C pins for MPU6050.
+#define IMU_I2C_SDA_PIN 10
 #define IMU_I2C_SCL_PIN 9
 #define IMU_I2C_FREQ_HZ 400000UL
-#define MPU6050_ADDR 0x68
+#define MPU6050_ADDR_PRIMARY 0x68
+#define MPU6050_ADDR_SECONDARY 0x69
 
 // NEW: Motion sampling and fusion thresholds.
 #define MOTION_SAMPLE_RATE_HZ 100
 #define MOTION_RING_SECONDS 6
 #define MOTION_RING_SIZE (MOTION_SAMPLE_RATE_HZ * MOTION_RING_SECONDS)
 #define MOTION_FUSION_WINDOW_MS 1200UL
-#define ACCEL_MOTION_THRESHOLD_G 0.12f
+#define ACCEL_MOTION_THRESHOLD_G 0.15f
 #define MOTION_CALIB_SAMPLES 200
 // ======================= END NEW MOTION GATE CONFIG =======================
 
-// Model quantization parameters from cough_cnn_5s_base_int8.tflite
-const float MODEL_INPUT_SCALE = 0.09420423954725266f;
-const int MODEL_INPUT_ZERO_POINT = -1;
+const float MODEL_INPUT_SCALE = 0.08363225311040878f;
+const int MODEL_INPUT_ZERO_POINT = -21;
 const float OUTPUT_SCALE = 0.00390625f;
 const int OUTPUT_ZERO_POINT = -128;
 
 // Detection threshold
-const float COUGH_THRESHOLD = 0.60f;
+const float COUGH_THRESHOLD = 0.6f;
+const float MIN_AUDIO_PEAK = 0.080f; // reject impulsive clicks below this
+const float MIN_AUDIO_RMS = 0.030f;  // reject very quiet frames
+const unsigned long FUSION_COOLDOWN_MS = 1500UL;
 // Set to 1 if your model outputs [non_cough, cough]
 // Set to 0 if your model outputs [cough, non_cough]
 const int COUGH_INDEX = 1;
@@ -96,6 +85,10 @@ bool g_motion_sensor_ready = false;
 float g_acc_bias_x = 0.0f;
 float g_acc_bias_y = 0.0f;
 float g_acc_bias_z = 0.0f;
+static uint8_t g_mpu_addr = MPU6050_ADDR_PRIMARY;
+static uint8_t g_mpu_who = 0;
+unsigned long g_last_detection_ms = 0;
+// NEW: Selected MPU address and ID.
 // ======================= END NEW MOTION PIPELINE STATE =======================
 
 // ======================= FUNCTION DECLARATIONS =======================
@@ -111,15 +104,12 @@ bool getMotionWindowMetric(uint32_t window_ms, float &peak_dyn_acc_g, float &mea
 bool mpuWriteReg(uint8_t reg, uint8_t value);
 bool mpuReadRegs(uint8_t start_reg, uint8_t *buffer, size_t len);
 bool readAccelInG(float &ax_g, float &ay_g, float &az_g);
+bool detectMpuAddress(uint8_t &addr_out, uint8_t &who_out);
 // ======================= END NEW MOTION PIPELINE DECLARATIONS =======================
 void runInference()
 {
   // Timestamp (seconds since boot) for this inference
   unsigned long t_seconds = millis() / 1000;
-  unsigned long window_end_seconds = t_seconds;
-  unsigned long window_start_seconds = (window_end_seconds > ANALYSIS_SECONDS)
-                                           ? (window_end_seconds - ANALYSIS_SECONDS)
-                                           : 0;
 
   // 1. Extract MFCC features directly into PSRAM buffer
   unsigned long featureStart = micros();
@@ -130,23 +120,8 @@ void runInference()
   }
   unsigned long featureTime = micros() - featureStart;
 
-  // Debug telemetry to verify that mic signal and MFCC input are changing
   float rms = 0.0f, peak = 0.0f, dc = 0.0f;
   audioProcessor.getAudioStats(rms, peak, dc);
-
-  int q_min = 127;
-  int q_max = -128;
-  long q_abs_sum = 0;
-  for (int i = 0; i < NUM_INPUTS; i++)
-  {
-    int q = (int)g_model_input_buffer[i];
-    if (q < q_min)
-      q_min = q;
-    if (q > q_max)
-      q_max = q;
-    q_abs_sum += abs(q - MODEL_INPUT_ZERO_POINT);
-  }
-  float q_abs_mean = (float)q_abs_sum / (float)NUM_INPUTS;
 
   // 2. Run inference
   unsigned long startTime = micros();
@@ -170,43 +145,32 @@ void runInference()
   float p_non_cough = (COUGH_INDEX == 0) ? p1 : p0;
 
   // ======================= NEW: Decision-level fusion (audio AND motion) =======================
+  // Catch up IMU sampling before evaluating the motion window (MFCC extraction blocks for ~4.5s).
+  updateMotionPipeline();
   bool audio_hit = (p_cough >= COUGH_THRESHOLD);
   float motion_peak_dyn_g = 0.0f;
   float motion_mean_dyn_g = 0.0f;
   bool motion_window_ok = getMotionWindowMetric(MOTION_FUSION_WINDOW_MS, motion_peak_dyn_g, motion_mean_dyn_g);
   bool motion_hit = motion_window_ok && (motion_peak_dyn_g >= ACCEL_MOTION_THRESHOLD_G);
-  bool fusion_hit = audio_hit && motion_hit;
+  bool audio_shape_ok = (peak >= MIN_AUDIO_PEAK) && (rms >= MIN_AUDIO_RMS);
+  bool cooldown_ok = (millis() - g_last_detection_ms) >= FUSION_COOLDOWN_MS;
+  bool fusion_hit = audio_hit && motion_hit && audio_shape_ok && cooldown_ok;
   // ======================= END NEW: Decision-level fusion (audio AND motion) =======================
 
-  // 4. Display results with timestamp and inference time
-  Serial.printf("[%lus] Window:[%lu-%lu]s Feature:%lu us Inference:%lu us Class0:%.4f Class1:%.4f Probabilities:[Cough:%.4f Non-Cough:%.4f]\n",
-                t_seconds, window_start_seconds, window_end_seconds,
-                featureTime, inferenceTime, p0, p1, p_cough, p_non_cough);
-  Serial.printf("      Audio[RMS=%.6f Peak=%.6f DC=%.6f] MFCC[qmin=%d qmax=%d mean|q-zp|=%.2f]\n",
-                rms, peak, dc, q_min, q_max, q_abs_mean);
-  // NEW: Motion + fusion telemetry for tuning thresholds.
-  Serial.printf("      Motion[peak_dyn=%.4fg mean_dyn=%.4fg win=%lums data=%s] Fusion[audio=%s motion=%s final=%s]\n",
-                motion_peak_dyn_g, motion_mean_dyn_g, MOTION_FUSION_WINDOW_MS,
-                motion_window_ok ? "yes" : "no",
+  // 4. Summary log per inference
+  Serial.printf("[%lus] cough=%.3f rms=%.4f peak=%.4f motion=%.4f audio=%s motion=%s shape=%s cooldown=%s fusion=%s\n",
+                t_seconds, p_cough, rms, peak, motion_peak_dyn_g,
                 audio_hit ? "hit" : "miss",
                 motion_hit ? "hit" : "miss",
+                audio_shape_ok ? "ok" : "bad",
+                cooldown_ok ? "ok" : "wait",
                 fusion_hit ? "hit" : "miss");
-
-  if (peak < 0.003f || q_abs_mean < 0.75f)
-  {
-    Serial.println("      WARNING: Mic/features look too flat. Check INMP441 L/R pin, wiring, and I2S format.");
-  }
-
-  // 5. Detection logic (strict fusion gate)
-  if (audio_hit && !motion_hit)
-  {
-    Serial.println("      Audio hit but motion gate failed -> rejected.");
-  }
 
   if (fusion_hit)
   {
-    Serial.println("  >>> COUGH DETECTED (AUDIO + MOTION) <<<");
-
+    Serial.printf("[%.0lus] COUGH DETECTED  p=%.3f  audio=%.4f  motion=%.4f\n",
+                  t_seconds, p_cough, peak, motion_peak_dyn_g);
+    g_last_detection_ms = millis();
     // Send event to backend
     postDetection(p_cough, peak, motion_peak_dyn_g);
   }
@@ -299,7 +263,7 @@ void loop()
   static unsigned long lastStatusTime = 0;
   // MFCC extraction takes longer for a 5s window on ESP32-S3.
   // Keep only a short post-inference capture gap to improve responsiveness.
-  const unsigned long INFERENCE_INTERVAL_MS = 1000UL;
+  const unsigned long INFERENCE_INTERVAL_MS = 500UL;
   const unsigned long STATUS_INTERVAL_MS = 5000;
 
   unsigned long currentTime = millis();
@@ -532,7 +496,7 @@ bool initializeModel()
 
   // Load the model
   Serial.println("Loading TensorFlow Lite model...");
-  auto status = tf.begin(cough_cnn_5s_base_int8_tflite);
+  auto status = tf.begin(cough_cnn_5s_transfer_esp32_int8_tflite);
 
   if (!status.isOk())
   {
@@ -542,7 +506,7 @@ bool initializeModel()
   }
 
   Serial.println(" Model loaded successfully");
-  Serial.printf("  Model size: %d bytes\n", cough_cnn_5s_base_int8_tflite_len);
+  Serial.printf("  Model size: %d bytes\n", cough_cnn_5s_transfer_esp32_int8_tflite_len);
   Serial.printf("  Tensor arena: %d bytes\n", TENSOR_ARENA_SIZE);
 
   // Run a dummy inference to warm up
@@ -583,7 +547,7 @@ bool initializeAudioProcessor()
 // ======================= NEW: MPU6050 MOTION PIPELINE IMPLEMENTATION =======================
 bool mpuWriteReg(uint8_t reg, uint8_t value)
 {
-  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.beginTransmission(g_mpu_addr);
   Wire.write(reg);
   Wire.write(value);
   return (Wire.endTransmission() == 0);
@@ -591,14 +555,14 @@ bool mpuWriteReg(uint8_t reg, uint8_t value)
 
 bool mpuReadRegs(uint8_t start_reg, uint8_t *buffer, size_t len)
 {
-  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.beginTransmission(g_mpu_addr);
   Wire.write(start_reg);
   if (Wire.endTransmission(false) != 0)
   {
     return false;
   }
 
-  size_t received = Wire.requestFrom((int)MPU6050_ADDR, (int)len, (int)true);
+  size_t received = Wire.requestFrom((int)g_mpu_addr, (int)len, (int)true);
   if (received != len)
   {
     return false;
@@ -637,23 +601,21 @@ bool initializeMotionPipeline()
   Serial.println("--- Motion Pipeline Initialization ---");
   Serial.printf("I2C pins: SDA=%d SCL=%d\n", IMU_I2C_SDA_PIN, IMU_I2C_SCL_PIN);
 
-  Wire.begin(IMU_I2C_SDA_PIN, IMU_I2C_SCL_PIN, IMU_I2C_FREQ_HZ);
-  Wire.setTimeOut(3);
+  // Use explicit SDA/SCL matching the verified wiring (SDA=9, SCL=10) and a conservative 100 kHz clock for stability.
+  Wire.begin(IMU_I2C_SDA_PIN, IMU_I2C_SCL_PIN);
+  // Use a conservative clock for bring-up; raise later if stable.
+  Wire.setClock(100000);
+  // Increase timeout to avoid premature aborts on slower responses.
+  Wire.setTimeOut(50);
   delay(20);
 
-  // Verify WHO_AM_I
-  uint8_t who_am_i = 0;
-  if (!mpuReadRegs(0x75, &who_am_i, 1))
+  // Detect address (0x68 vs 0x69) and wake device if needed
+  if (!detectMpuAddress(g_mpu_addr, g_mpu_who))
   {
-    Serial.println(" Failed to read MPU6050 WHO_AM_I.");
+    Serial.println(" MPU6050 not detected on 0x68 or 0x69. Check wiring/power.");
     return false;
   }
-
-  if (who_am_i != 0x68 && who_am_i != 0x69)
-  {
-    Serial.printf(" Unexpected MPU6050 WHO_AM_I: 0x%02X\n", who_am_i);
-    return false;
-  }
+  Serial.printf(" MPU6050 detected at address 0x%02X (WHO_AM_I=0x%02X)\n", g_mpu_addr, g_mpu_who);
 
   // Reset then wake the sensor
   if (!mpuWriteReg(0x6B, 0x80))
@@ -714,10 +676,21 @@ bool initializeMotionPipeline()
   g_next_motion_sample_us = micros() + (1000000UL / MOTION_SAMPLE_RATE_HZ);
   g_motion_sensor_ready = true;
 
-  Serial.printf("MPU6050 ready (WHO_AM_I=0x%02X)\n", who_am_i);
+  Serial.printf("MPU6050 ready (WHO_AM_I=0x%02X)\n", g_mpu_who);
   Serial.printf("Accel bias: x=%.4fg y=%.4fg z=%.4fg\n", g_acc_bias_x, g_acc_bias_y, g_acc_bias_z);
   Serial.printf("Motion gate: window=%lu ms threshold=%.3fg\n",
                 MOTION_FUSION_WINDOW_MS, ACCEL_MOTION_THRESHOLD_G);
+
+  // Quick sanity sample
+  float ax, ay, az;
+  if (readAccelInG(ax, ay, az))
+  {
+    Serial.printf("Initial accel sample: ax=%.3fg ay=%.3fg az=%.3fg\n", ax, ay, az);
+  }
+  else
+  {
+    Serial.println(" WARNING: Failed initial accel read after init.");
+  }
   return true;
 }
 
@@ -730,6 +703,7 @@ void updateMotionPipeline()
 
   uint32_t now_us = micros();
   const uint32_t sample_period_us = 1000000UL / MOTION_SAMPLE_RATE_HZ;
+  static uint32_t imu_fail_count = 0;
 
   // Catch-up loop ensures fixed-rate sampling even if loop had blocking work.
   while ((int32_t)(now_us - g_next_motion_sample_us) >= 0)
@@ -739,7 +713,16 @@ void updateMotionPipeline()
     float ax = 0.0f, ay = 0.0f, az = 0.0f;
     if (!readAccelInG(ax, ay, az))
     {
+      imu_fail_count++;
+      if (imu_fail_count % 10 == 0)
+      {
+        Serial.println("      IMU read failed (check wiring/address/power)");
+      }
       break;
+    }
+    else
+    {
+      imu_fail_count = 0;
     }
 
     // Apply calibration bias and compute dynamic acceleration magnitude.
@@ -807,3 +790,44 @@ bool getMotionWindowMetric(uint32_t window_ms, float &peak_dyn_acc_g, float &mea
   return true;
 }
 // ======================= END NEW: MPU6050 MOTION PIPELINE IMPLEMENTATION =======================
+
+// Try both common MPU6050 addresses and wake the device like the reference sketch.
+bool detectMpuAddress(uint8_t &addr_out, uint8_t &who_out)
+{
+  uint8_t candidates[2] = {MPU6050_ADDR_PRIMARY, MPU6050_ADDR_SECONDARY};
+  for (uint8_t i = 0; i < 2; i++)
+  {
+    uint8_t addr = candidates[i];
+
+    // Force wake (PWR_MGMT_1 = 0)
+    Wire.beginTransmission(addr);
+    Wire.write(0x6B);
+    Wire.write(0x00);
+    if (Wire.endTransmission() != 0)
+    {
+      continue;
+    }
+    delay(50);
+
+    uint8_t who = 0;
+    Wire.beginTransmission(addr);
+    Wire.write(0x75);
+    if (Wire.endTransmission(false) != 0)
+    {
+      continue;
+    }
+    if (Wire.requestFrom((int)addr, 1, (int)true) != 1)
+    {
+      continue;
+    }
+    who = Wire.read();
+
+    if (who == 0x68 || who == 0x69 || who == 0x70 || who == 0x71 || who == 0x34)
+    {
+      addr_out = addr;
+      who_out = who;
+      return true;
+    }
+  }
+  return false;
+}

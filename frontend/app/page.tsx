@@ -1,5 +1,5 @@
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:5000/api";
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://10.237.133.1:5000/api";
 
 type Severity = "Low" | "Medium" | "High";
 
@@ -118,7 +118,6 @@ export default async function Home() {
   const { ok, data } = await fetchDetections();
   const { events, hourly, summary } = buildViewModel(data);
   const maxHourly = Math.max(...hourly.map((entry) => entry.count), 1);
-  const apiBase = API_BASE;
 
   return (
     <div className="min-h-screen px-4 py-6 sm:px-8 sm:py-10">
@@ -268,8 +267,16 @@ export default async function Home() {
                   <svg viewBox="0 0 100 40" className="h-32 w-full">
                     <defs>
                       <linearGradient id="areaFill" x1="0" x2="0" y1="0" y2="1">
-                        <stop offset="0%" stopColor="#a7e0c2" stopOpacity="0.35" />
-                        <stop offset="100%" stopColor="#a7e0c2" stopOpacity="0" />
+                        <stop
+                          offset="0%"
+                          stopColor="#a7e0c2"
+                          stopOpacity="0.35"
+                        />
+                        <stop
+                          offset="100%"
+                          stopColor="#a7e0c2"
+                          stopOpacity="0"
+                        />
                       </linearGradient>
                     </defs>
                     <polyline
@@ -308,11 +315,11 @@ export default async function Home() {
                   </div>
                 </div>
                 <p className="mt-2 text-xs text-[color:var(--muted)]">
-                  Peak: {Math.max(...hourly.map((h) => h.count))} events in an hour.
+                  Peak: {Math.max(...hourly.map((h) => h.count))} events in an
+                  hour.
                 </p>
               </div>
             </article>
-
           </aside>
         </section>
       </main>

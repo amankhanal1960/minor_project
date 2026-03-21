@@ -10,3 +10,4 @@ model/*.h5
 model/*.tflite
 model/*.h
 model/esp32_dataset/
+esp32_dataset/
