@@ -20,8 +20,8 @@
 
 #define NUM_FRAMES 155
 
-#define ANALYSIS_SAMPLES (N_FFT + (NUM_FRAMES - 1) * HOP_LENGTH) 
-#define ANALYSIS_SECONDS_FLOAT (ANALYSIS_SAMPLES / (float)SAMPLE_RATE)  
+#define ANALYSIS_SAMPLES (N_FFT + (NUM_FRAMES - 1) * HOP_LENGTH)
+#define ANALYSIS_SECONDS_FLOAT (ANALYSIS_SAMPLES / (float)SAMPLE_RATE)
 
 #define NUM_INPUTS (NUM_FRAMES * NUM_MFCCS) // 155 * 40
 
@@ -36,7 +36,7 @@ class MFCCExtractor
 public:
     MFCCExtractor();
     ~MFCCExtractor();
-    
+
     // Initializes FFT, window, Mel filterbank, DCT matrix, and working buffers.
     bool begin();
 
@@ -120,8 +120,8 @@ private:
 class AudioProcessor
 {
 public:
-    AudioProcessor(int bckPin, int wsPin, int sdPin,float input_scale = 0.09420423954725266f,
-                   int input_zero_point = -1, i2s_port_t port = I2S_NUM_0);
+    AudioProcessor(int bckPin, int wsPin, int sdPin, float input_scale = 0.08065025508403778f,
+                   int input_zero_point = -18, i2s_port_t port = I2S_NUM_0);
     ~AudioProcessor();
     // Initialize I2S and audio processing
     bool begin(int sampleRate = 16000);
@@ -146,8 +146,8 @@ public:
     void processIncremental(const int32_t *i2s_samples, int count);
     bool getCurrentMFCC(int8_t *mfcc_output);
 
-
-    void setAudioBuffer(float* external_buffer) {
+    void setAudioBuffer(float *external_buffer)
+    {
         _audio_buffer = external_buffer;
     }
 
@@ -162,7 +162,7 @@ private:
     int _input_zero_point;
 
     // Audio buffer (circular)
-    float* _audio_buffer; 
+    float *_audio_buffer;
     int _write_index;
 
     // MFCC Extractor

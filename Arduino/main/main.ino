@@ -8,48 +8,45 @@
 #include "audio_processor.h"
 
 // ======================= NETWORK / BACKEND CONFIG =======================
-// TODO: replace with your Wi‑Fi credentials
 const char *WIFI_SSID = "Aman Pixel";
 const char *WIFI_PASS = "12345678";
 
-// TODO: replace with your registered device ID from the backend
 const char *DEVICE_ID = "device-123";
 
-// Backend base URL (no trailing slash)
+// Backend base URL
 const char *API_BASE = "http://10.237.133.1:5000/api";
-// ======================= END NETWORK CONFIG =======================
 
 // ======================= HARDWARE CONFIG =======================
 
-#define I2S_BCK_PIN 5 // Bit clock - connect to INMP441 SCK
-#define I2S_WS_PIN 4  // Word select - connect to INMP441 WS
-#define I2S_SD_PIN 6  // Serial data - connect to INMP441 SD
+#define I2S_BCK_PIN 5 // Bit clock - SCK
+#define I2S_WS_PIN 4  // Word select - WS
+#define I2S_SD_PIN 6  // Serial data - SD
 #define I2S_PORT I2S_NUM_0
 
-// ======================= NEW: MPU6050 MOTION GATE CONFIG =======================
-// NEW: I2C pins for MPU6050.
+// ======================= MPU6050 MOTION GATE CONFIG =======================
+// I2C pins for MPU6050.
 #define IMU_I2C_SDA_PIN 10
 #define IMU_I2C_SCL_PIN 9
 #define IMU_I2C_FREQ_HZ 400000UL
 #define MPU6050_ADDR_PRIMARY 0x68
 #define MPU6050_ADDR_SECONDARY 0x69
 
-// NEW: Motion sampling and fusion thresholds.
+// Motion sampling and fusion thresholds.
 #define MOTION_SAMPLE_RATE_HZ 100
 #define MOTION_RING_SECONDS 6
 #define MOTION_RING_SIZE (MOTION_SAMPLE_RATE_HZ * MOTION_RING_SECONDS)
 #define MOTION_FUSION_WINDOW_MS 1200UL
 #define ACCEL_MOTION_THRESHOLD_G 0.15f
 #define MOTION_CALIB_SAMPLES 200
-// ======================= END NEW MOTION GATE CONFIG =======================
+// ======================= END MOTION GATE CONFIG =======================
 
-const float MODEL_INPUT_SCALE = 0.08363225311040878f;
-const int MODEL_INPUT_ZERO_POINT = -21;
+const float MODEL_INPUT_SCALE = 0.08065025508403778f;
+const int MODEL_INPUT_ZERO_POINT = -18;
 const float OUTPUT_SCALE = 0.00390625f;
 const int OUTPUT_ZERO_POINT = -128;
 
 // Detection threshold
-const float COUGH_THRESHOLD = 0.6f;
+const float COUGH_THRESHOLD = 0.45f;
 const float MIN_AUDIO_PEAK = 0.080f; // reject impulsive clicks below this
 const float MIN_AUDIO_RMS = 0.030f;  // reject very quiet frames
 const unsigned long FUSION_COOLDOWN_MS = 1500UL;
@@ -158,17 +155,15 @@ void runInference()
   // ======================= END NEW: Decision-level fusion (audio AND motion) =======================
 
   // 4. Summary log per inference
-  Serial.printf("[%lus] cough=%.3f rms=%.4f peak=%.4f motion=%.4f audio=%s motion=%s shape=%s cooldown=%s fusion=%s\n",
-                t_seconds, p_cough, rms, peak, motion_peak_dyn_g,
+  Serial.printf("[%lus] cough=%.3f  peak=%.4f motion=%.4f audio=%s motion=%s  fusion=%s\n",
+                t_seconds, p_cough, peak, motion_peak_dyn_g,
                 audio_hit ? "hit" : "miss",
                 motion_hit ? "hit" : "miss",
-                audio_shape_ok ? "ok" : "bad",
-                cooldown_ok ? "ok" : "wait",
                 fusion_hit ? "hit" : "miss");
 
   if (fusion_hit)
   {
-    Serial.printf("[%.0lus] COUGH DETECTED  p=%.3f  audio=%.4f  motion=%.4f\n",
+    Serial.printf("[%.0lus] 🚨🚨🚨 COUGH DETECTED 🚨🚨🚨 p=%.3f  audio=%.4f  motion=%.4f\n",
                   t_seconds, p_cough, peak, motion_peak_dyn_g);
     g_last_detection_ms = millis();
     // Send event to backend
@@ -496,7 +491,7 @@ bool initializeModel()
 
   // Load the model
   Serial.println("Loading TensorFlow Lite model...");
-  auto status = tf.begin(cough_cnn_5s_transfer_esp32_int8_tflite);
+  auto status = tf.begin(cough_cnn_5s_transfer_int8_tflite);
 
   if (!status.isOk())
   {
@@ -506,7 +501,7 @@ bool initializeModel()
   }
 
   Serial.println(" Model loaded successfully");
-  Serial.printf("  Model size: %d bytes\n", cough_cnn_5s_transfer_esp32_int8_tflite_len);
+  Serial.printf("  Model size: %d bytes\n", cough_cnn_5s_transfer_int8_tflite_len);
   Serial.printf("  Tensor arena: %d bytes\n", TENSOR_ARENA_SIZE);
 
   // Run a dummy inference to warm up

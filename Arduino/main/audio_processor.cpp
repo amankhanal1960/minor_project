@@ -924,7 +924,11 @@ void AudioProcessor::getAudioStats(float &rms, float &peak, float &dc_offset)
 
     dc_offset = sum / num_samples;
     rms = sqrtf(sum_sq / num_samples);
-    peak = max_val;
+    // Deglitch peak: suppress rare spikes much larger than the overall energy.
+    float glitch_cap = (5.0f * rms) + 0.05f; // allow peaks up to 5x RMS plus a small floor
+    if (glitch_cap > 1.0f)
+        glitch_cap = 1.0f;
+    peak = (max_val > glitch_cap) ? glitch_cap : max_val;
 }
 
 void AudioProcessor::logAudioStats()

@@ -9,6 +9,7 @@ xxd -i cough_cnn_5s_transfer_esp32_int8.tflite > "../Arduino copy/main/model_dat
 ```
 
 This generates symbols:
+
 - `cough_cnn_5s_transfer_esp32_int8_tflite`
 - `cough_cnn_5s_transfer_esp32_int8_tflite_len`
 
@@ -50,12 +51,12 @@ with dst.open("w", encoding="utf-8") as f:
     f.write("#endif  // MODEL_DATA_5S_TRANSFER_H\n")
 ```
 
-
 ---
 
 # 5-second data collection (ESP32 -> Python)
 
 Use sketch:
+
 - `Arduino copy/audio_collector_5s/audio_collector_5s.ino`
 
 Then run collector from repo root:
@@ -69,3 +70,5 @@ If your serial link is slow/noisy, increase timeout:
 ```bash
 python model/collect_esp32_audio.py --port COM10 --baud 921600 --clip-seconds 5 --stall-timeout 30 --out model/esp32_dataset
 ```
+
+python collect_esp32_audio.py --port COM9 --baud 460800
